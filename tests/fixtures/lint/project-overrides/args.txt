@@ -1,0 +1,6 @@
+--project
+${fixture_dir}/project.godot
+lint
+--disallow-tabs
+--require-spaces-around-operators
+${fixture}

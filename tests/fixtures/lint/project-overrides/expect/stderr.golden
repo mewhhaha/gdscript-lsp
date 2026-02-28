@@ -1,0 +1,5 @@
+a=1
+ ^ Missing spaces around operator
+	print("ok")
+^ tabs are replaced with spaces
+lint failed

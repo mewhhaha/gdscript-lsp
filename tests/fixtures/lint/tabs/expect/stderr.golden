@@ -1,0 +1,3 @@
+	return 1
+^ tabs are replaced with spaces
+lint failed

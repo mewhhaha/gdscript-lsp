@@ -1,0 +1,20 @@
+name	signature	hover
+absf	absf(x: float) -> float	Returns the absolute value of a float.
+absi	absi(x: int) -> int	Returns the absolute value of an int.
+clampi	clampi(value: int, min: int, max: int) -> int	Clamps an int value between min and max.
+cos	cos(angle_rad: float) -> float	Returns the cosine of an angle in radians.
+tan	tan(angle_rad: float) -> float	Returns the tangent of an angle in radians.
+ceilf	ceilf(x: float) -> float	Rounds a float upward to the nearest whole value.
+floorf	floorf(x: float) -> float	Rounds a float downward to the nearest whole value.
+roundf	roundf(x: float) -> float	Rounds a float to the nearest whole value.
+lerp	lerp(from: Variant, to: Variant, weight: Variant) -> Variant	Linearly interpolates between two values.
+remap	remap(value: float, istart: float, istop: float, ostart: float, ostop: float) -> float	Maps a value from one range to another.
+is_equal_approx	is_equal_approx(a: float, b: float) -> bool	Returns true if two floats are approximately equal.
+is_zero_approx	is_zero_approx(x: float) -> bool	Returns true if a float is effectively zero.
+randf_range	randf_range(from: float, to: float) -> float	Returns a random float in the provided range.
+randfn	randfn(mean: float, deviation: float) -> float	Returns a normally distributed random float.
+var_to_str	var_to_str(variable: Variant) -> String	Converts a Variant to a serialized string representation.
+str_to_var	str_to_var(string: String) -> Variant	Converts a serialized string back to a Variant.
+print	print(...args) -> void	Prints values to output.
+preload	preload(path: String) -> Resource	Loads a resource at parse time.
+len	len(value: Variant) -> int	Returns collection length.

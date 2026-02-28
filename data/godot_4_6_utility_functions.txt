@@ -1,0 +1,14 @@
+char
+color8
+convert
+dict_to_inst
+get_stack
+inst_to_dict
+is_instance_of
+len
+load
+ord
+print_debug
+print_stack
+range
+type_exists

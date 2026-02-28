@@ -1,0 +1,4 @@
+--project
+${fixture_dir}/project.godot
+lint
+${fixture}

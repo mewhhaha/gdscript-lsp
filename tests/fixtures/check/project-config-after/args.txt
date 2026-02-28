@@ -1,0 +1,4 @@
+check
+${fixture}
+--project
+${fixture_dir}/project.godot

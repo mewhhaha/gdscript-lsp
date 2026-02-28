@@ -1,0 +1,3 @@
+[gdscript]
+lint/allow_tabs=true
+lint/require_spaces_around_operators=false

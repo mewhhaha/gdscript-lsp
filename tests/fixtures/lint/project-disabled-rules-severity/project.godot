@@ -1,0 +1,3 @@
+[gdscript]
+disabled_rules="no-tabs"
+severity_overrides="no-tabs=ignore"

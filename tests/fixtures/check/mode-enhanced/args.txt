@@ -1,0 +1,4 @@
+--mode
+enhanced
+check
+${fixture}

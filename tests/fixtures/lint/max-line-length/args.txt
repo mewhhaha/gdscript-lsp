@@ -1,0 +1,4 @@
+lint
+--max-line-length
+10
+${fixture}

@@ -1,0 +1,4 @@
+--mode
+parity
+check
+${fixture}

@@ -1,0 +1,3 @@
+a =1
+  ^ Missing spaces around operator
+lint failed
