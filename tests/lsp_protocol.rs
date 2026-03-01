@@ -1,6 +1,11 @@
 use gdscript_lsp::lsp;
-use serde_json::{self, Value};
-use std::{collections::HashSet, fs, path::PathBuf};
+use serde_json::{self, Value, json};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn run_lsp(input: &str) -> String {
     let mut out = Vec::new();
@@ -90,6 +95,10 @@ fn did_open_message(uri: &str, source: &str) -> String {
         },
     }))
     .unwrap()
+}
+
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
 }
 
 #[test]
@@ -304,11 +313,13 @@ fn initialize_reports_core_capabilities() {
     let output = run_lsp("{\"id\":1,\"method\":\"initialize\"}\n{\"method\":\"exit\"}\n");
     assert!(output.contains("hoverProvider"), "output: {output}");
     assert!(output.contains("codeActionProvider"), "output: {output}");
+    assert!(output.contains("renameProvider"), "output: {output}");
 }
 
 #[test]
 fn initialize_reports_lsp_317_diagnostic_provider_shape() {
-    let responses = run_lsp_responses("{\"id\":1,\"method\":\"initialize\"}\n{\"method\":\"exit\"}\n");
+    let responses =
+        run_lsp_responses("{\"id\":1,\"method\":\"initialize\"}\n{\"method\":\"exit\"}\n");
     let init = response_by_id(&responses, 1).expect("initialize response");
     let diagnostic_provider = &init["result"]["capabilities"]["diagnosticProvider"];
 
@@ -343,6 +354,138 @@ fn hover_method_returns_builtin_payload() {
     );
 
     assert!(output.contains("print"), "output: {output}");
+}
+
+#[test]
+fn hover_method_returns_node_method_payload() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"extends Node\\nfunc _ready():\\n    queue_free()\\n\",\"line\":3,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("queue_free"),
+        "hover should include node method symbol: {output}"
+    );
+    assert!(
+        output.contains("Node method"),
+        "hover should include node method context: {output}"
+    );
+}
+
+#[test]
+fn hover_on_value_includes_type_value_and_comments() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"# health points\\nvar health: int = 100 # initial hp\\nfunc _ready():\\n    print(health)\\n\",\"line\":4,\"character\":11}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(output.contains("Type: `int`"), "output: {output}");
+    assert!(output.contains("Value: `100`"), "output: {output}");
+    assert!(output.contains("health points"), "output: {output}");
+    assert!(output.contains("initial hp"), "output: {output}");
+}
+
+#[test]
+fn hover_on_type_uses_local_declaration_context() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"# Player entity\\nclass Player:\\n    pass\\nvar actor: Player\\n\",\"line\":4,\"character\":12}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(output.contains("class"), "output: {output}");
+    assert!(output.contains("Type: `type`"), "output: {output}");
+    assert!(output.contains("Player entity"), "output: {output}");
+}
+
+#[test]
+fn hover_on_literal_includes_literal_type() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    print(42)\\n\",\"line\":2,\"character\":12}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(output.contains("Type: `int`"), "output: {output}");
+    assert!(output.contains("Value: `42`"), "output: {output}");
+}
+
+#[test]
+fn hover_handles_shadowing_nested_scope_and_multiline_function_sections() {
+    let source = fixture_text("lsp", "hover-rich", "input.gd");
+    let uri = "file:///tmp/fixtures/gdscript-lsp-hover-rich.gd";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(uri, &source));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":22,\"character\":19}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":3,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":23,\"character\":15}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":15,\"character\":11}}}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let inner = response_by_id(&responses, 2).expect("inner shadow hover");
+    let outer = response_by_id(&responses, 3).expect("outer shadow hover");
+    let function_hover = response_by_id(&responses, 4).expect("function hover");
+
+    assert!(
+        inner["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Value: `99`")),
+        "inner scope hover should resolve nested shadowed variable: {inner:#?}"
+    );
+    assert!(
+        outer["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Value: `10`")),
+        "outer scope hover should resolve function-level variable: {outer:#?}"
+    );
+    let function_contents = function_hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        function_contents.contains("Parameters: player_name: String, multiplier: float = 1.0"),
+        "multiline function hover should include parameter section: {function_hover:#?}"
+    );
+    assert!(
+        function_contents.contains("Returns: `int`"),
+        "function hover should include return type section: {function_hover:#?}"
+    );
+}
+
+#[test]
+fn hover_type_sections_include_inheritance_and_enum_members() {
+    let source = fixture_text("lsp", "hover-rich", "input.gd");
+    let uri = "file:///tmp/fixtures/gdscript-lsp-hover-rich-type.gd";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(uri, &source));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":6,\"character\":8}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":3,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":13,\"character\":16}}}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let actor_hover = response_by_id(&responses, 2).expect("Actor hover");
+    let enum_hover = response_by_id(&responses, 3).expect("State enum hover");
+
+    assert!(
+        actor_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Inherits: `BaseEntity`")),
+        "class hover should include inheritance section: {actor_hover:#?}"
+    );
+    assert!(
+        enum_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("Members: IDLE, RUNNING, JUMPING")),
+        "enum hover should include enum member list: {enum_hover:#?}"
+    );
 }
 
 #[test]
@@ -409,6 +552,62 @@ fn tracked_document_lifecycle_uses_uri_for_diagnostics_and_edits() {
             .as_str()
             .is_some_and(|contents| contents.contains("print")),
         "hover should resolve builtin against tracked URI document: {hover:#?}"
+    );
+}
+
+#[test]
+fn code_action_includes_explicit_type_annotation_fix() {
+    let responses = run_lsp_responses(
+        "{\"id\":1,\"method\":\"textDocument/codeAction\",\"params\":{\"text\":\"func _ready():\\n    var speed := 3.5\\n\",\"range\":{\"start\":{\"line\":2,\"character\":9},\"end\":{\"line\":2,\"character\":9}}}}\n{\"method\":\"exit\"}\n",
+    );
+    let code_action = response_by_id(&responses, 1).expect("codeAction response");
+    let actions = code_action["result"].as_array().expect("actions");
+    let annotate = actions
+        .iter()
+        .find(|action| action["title"] == "Add explicit type annotation")
+        .expect("explicit type annotation action");
+
+    assert_eq!(
+        annotate["edit"]["changes"]["stdin://lsp.gd"][0]["newText"].as_str(),
+        Some("    var speed: float = 3.5"),
+        "annotation replacement should include inferred float type: {annotate:#?}"
+    );
+}
+
+#[test]
+fn code_action_includes_declaration_context_action() {
+    let uri = "file:///tmp/fixtures/gdscript-lsp-code-action-declaration.gd";
+    let source = fixture_text("lsp", "definition-references", "input.gd");
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(uri, &source));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"range\":{{\"start\":{{\"line\":5,\"character\":6}},\"end\":{{\"line\":5,\"character\":6}}}}}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let code_action = response_by_id(&responses, 2).expect("codeAction response");
+    let actions = code_action["result"].as_array().expect("actions");
+    let declaration_context = actions
+        .iter()
+        .find(|action| {
+            action["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("Show declaration context"))
+        })
+        .expect("declaration context action");
+
+    assert_eq!(
+        declaration_context["command"]["command"].as_str(),
+        Some("gdscript-lsp.showDeclaration"),
+        "declaration action should provide executable command metadata: {declaration_context:#?}"
+    );
+    assert_eq!(
+        declaration_context["data"]["symbol"].as_str(),
+        Some("define_value"),
+        "declaration action should include symbol payload: {declaration_context:#?}"
     );
 }
 
@@ -542,7 +741,8 @@ fn framed_initialized_notification_does_not_emit_method_not_found() {
     );
     assert!(
         responses.iter().all(|value| {
-            value.get("error")
+            value
+                .get("error")
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .map(|message| message != "unknown method")
@@ -706,6 +906,85 @@ fn lsp_definition_supports_line_and_framed_transports() {
 }
 
 #[test]
+fn lsp_definition_falls_back_to_docs_for_builtin_and_node_methods() {
+    let responses = run_lsp_responses(
+        "{\"id\":1,\"method\":\"textDocument/definition\",\"params\":{\"text\":\"func _ready():\\n    print(\\\"x\\\")\\n\",\"line\":2,\"character\":7}}\n{\"id\":2,\"method\":\"textDocument/definition\",\"params\":{\"text\":\"extends Node\\nfunc _ready():\\n    queue_free()\\n\",\"line\":3,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+    let builtin = response_by_id(&responses, 1).expect("builtin definition");
+    let node = response_by_id(&responses, 2).expect("node definition");
+    let builtin_locations = builtin["result"].as_array().expect("builtin locations");
+    let node_locations = node["result"].as_array().expect("node locations");
+
+    assert_eq!(
+        builtin_locations.len(),
+        1,
+        "builtin definition: {builtin:#?}"
+    );
+    assert!(
+        builtin_locations[0]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("class_@globalscope")),
+        "builtin definition should point to globalscope docs: {builtin:#?}"
+    );
+
+    assert_eq!(node_locations.len(), 1, "node definition: {node:#?}");
+    assert!(
+        node_locations[0]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("class_node")),
+        "node definition should point to Node docs: {node:#?}"
+    );
+}
+
+#[test]
+fn lsp_prepare_rename_and_rename_return_workspace_edits() {
+    let uri = "file:///tmp/fixtures/gdscript-lsp-rename.gd";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(
+        uri,
+        "var value := 1\nfunc test():\n    value += 1\n    print(value)\n",
+    ));
+    requests.push('\n');
+    requests.push_str(
+        "{\"id\":2,\"method\":\"textDocument/prepareRename\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/fixtures/gdscript-lsp-rename.gd\"},\"position\":{\"line\":3,\"character\":6}}}\n",
+    );
+    requests.push_str(
+        "{\"id\":3,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/fixtures/gdscript-lsp-rename.gd\"},\"position\":{\"line\":3,\"character\":6},\"newName\":\"count\"}}\n",
+    );
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let prepare = response_by_id(&responses, 2).expect("prepareRename response");
+    let rename = response_by_id(&responses, 3).expect("rename response");
+
+    assert_eq!(
+        prepare["result"]["placeholder"].as_str(),
+        Some("value"),
+        "prepareRename placeholder should be symbol under cursor: {prepare:#?}"
+    );
+    assert_eq!(
+        prepare["result"]["range"]["start"]["line"].as_u64(),
+        Some(3),
+        "prepareRename start line should match target symbol: {prepare:#?}"
+    );
+    assert_eq!(
+        prepare["result"]["range"]["start"]["character"].as_u64(),
+        Some(5),
+        "prepareRename start character should match symbol start: {prepare:#?}"
+    );
+
+    let edits = rename["result"]["changes"][uri]
+        .as_array()
+        .expect("rename edits");
+    assert_eq!(edits.len(), 3, "rename should edit all symbol occurrences");
+    assert!(
+        edits.iter().all(|edit| edit["newText"] == "count"),
+        "rename edits should carry requested symbol: {rename:#?}"
+    );
+}
+
+#[test]
 fn lsp_references_supports_line_and_framed_transports() {
     let source = fixture_text("lsp", "definition-references", "input.gd");
     let uri = "file:///tmp/fixtures/gdscript-lsp-references.gd";
@@ -748,6 +1027,231 @@ fn lsp_references_supports_line_and_framed_transports() {
         framed_lines.contains(&0),
         "framed references should include declaration line: {framed_references:#?}"
     );
+}
+
+#[test]
+fn lsp_definition_and_references_resolve_across_open_documents() {
+    let producer = fixture_text("lsp", "cross-file", "a.gd");
+    let consumer = fixture_text("lsp", "cross-file", "b.gd");
+    let producer_uri = "file:///tmp/fixtures/gdscript-lsp-cross-file-a.gd";
+    let consumer_uri = "file:///tmp/fixtures/gdscript-lsp-cross-file-b.gd";
+
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(producer_uri, &producer));
+    requests.push('\n');
+    requests.push_str(&did_open_message(consumer_uri, &consumer));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/definition\",\"params\":{{\"textDocument\":{{\"uri\":\"{consumer_uri}\"}},\"position\":{{\"line\":2,\"character\":21}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":3,\"method\":\"textDocument/references\",\"params\":{{\"textDocument\":{{\"uri\":\"{consumer_uri}\"}},\"position\":{{\"line\":2,\"character\":21}}}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let definition = response_by_id(&responses, 2).expect("definition response");
+    let references = response_by_id(&responses, 3).expect("references response");
+    let definition_locations = definition["result"]
+        .as_array()
+        .expect("definition locations");
+    let reference_locations = references["result"]
+        .as_array()
+        .expect("reference locations");
+    let reference_uris = reference_locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+
+    assert!(
+        definition_locations
+            .iter()
+            .any(|location| location["uri"] == producer_uri),
+        "definition should resolve to producer document: {definition:#?}"
+    );
+    assert!(
+        reference_uris.contains(producer_uri),
+        "references should include producer declaration: {references:#?}"
+    );
+    assert!(
+        reference_uris.contains(consumer_uri),
+        "references should include consumer call sites: {references:#?}"
+    );
+    assert!(
+        reference_locations.len() >= 3,
+        "references should include declaration and call sites: {references:#?}"
+    );
+}
+
+#[test]
+fn lsp_rename_applies_workspace_edits_across_files() {
+    let producer = fixture_text("lsp", "cross-file", "a.gd");
+    let consumer = fixture_text("lsp", "cross-file", "b.gd");
+    let producer_uri = "file:///tmp/fixtures/gdscript-lsp-cross-file-rename-a.gd";
+    let consumer_uri = "file:///tmp/fixtures/gdscript-lsp-cross-file-rename-b.gd";
+
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(producer_uri, &producer));
+    requests.push('\n');
+    requests.push_str(&did_open_message(consumer_uri, &consumer));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/rename\",\"params\":{{\"textDocument\":{{\"uri\":\"{consumer_uri}\"}},\"position\":{{\"line\":2,\"character\":21}},\"newName\":\"compute_value\"}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let rename = response_by_id(&responses, 2).expect("rename response");
+    let producer_edits = rename["result"]["changes"][producer_uri]
+        .as_array()
+        .expect("producer edits");
+    let consumer_edits = rename["result"]["changes"][consumer_uri]
+        .as_array()
+        .expect("consumer edits");
+
+    assert_eq!(
+        producer_edits.len(),
+        1,
+        "rename should update producer declaration once: {rename:#?}"
+    );
+    assert_eq!(
+        consumer_edits.len(),
+        2,
+        "rename should update both consumer call sites: {rename:#?}"
+    );
+    assert!(
+        producer_edits
+            .iter()
+            .chain(consumer_edits.iter())
+            .all(|edit| edit["newText"] == "compute_value"),
+        "rename edits should use requested symbol: {rename:#?}"
+    );
+}
+
+#[test]
+fn code_action_resolve_hydrates_lazy_declaration_context_edit() {
+    let uri = "file:///tmp/fixtures/gdscript-lsp-code-action-resolve.gd";
+    let source = fixture_text("lsp", "definition-references", "input.gd");
+
+    let mut first_pass = String::new();
+    first_pass.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    first_pass.push_str(&did_open_message(uri, &source));
+    first_pass.push('\n');
+    first_pass.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"range\":{{\"start\":{{\"line\":5,\"character\":6}},\"end\":{{\"line\":5,\"character\":6}}}}}}}}\n"
+    ));
+    first_pass.push_str("{\"method\":\"exit\"}\n");
+
+    let first_responses = run_lsp_responses(&first_pass);
+    let unresolved = response_by_id(&first_responses, 2).expect("codeAction response")["result"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .find(|action| {
+            action["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("Show declaration context"))
+        })
+        .cloned()
+        .expect("lazy declaration action");
+
+    assert!(
+        unresolved.get("edit").is_none(),
+        "declaration action should be lazily resolved: {unresolved:#?}"
+    );
+
+    let resolve_request = serde_json::to_string(&json!({
+        "id": 3,
+        "method": "codeAction/resolve",
+        "params": unresolved
+    }))
+    .expect("resolve request");
+
+    let mut second_pass = String::new();
+    second_pass.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    second_pass.push_str(&did_open_message(uri, &source));
+    second_pass.push('\n');
+    second_pass.push_str(&resolve_request);
+    second_pass.push('\n');
+    second_pass.push_str("{\"method\":\"exit\"}\n");
+
+    let second_responses = run_lsp_responses(&second_pass);
+    let resolved = response_by_id(&second_responses, 3).expect("resolve response");
+    let replacement = resolved["result"]["edit"]["changes"][uri][0]["newText"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        replacement.contains("func define_value():"),
+        "resolved action should carry declaration line edit: {resolved:#?}"
+    );
+}
+
+#[test]
+fn initialize_indexes_workspace_root_for_cross_file_definition() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gdscript-lsp-workspace-index-{stamp}"));
+    fs::create_dir_all(&root).expect("create workspace root");
+
+    let producer_path = root.join("producer.gd");
+    let consumer_path = root.join("consumer.gd");
+    fs::write(
+        &producer_path,
+        "func shared_value() -> int:\n    return 7\n",
+    )
+    .expect("write producer");
+    fs::write(
+        &consumer_path,
+        "func use_value() -> void:\n    var local := shared_value()\n",
+    )
+    .expect("write consumer");
+
+    let root_uri = file_uri(&root);
+    let producer_uri = file_uri(&producer_path);
+    let consumer_uri = file_uri(&consumer_path);
+    let init = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root_uri
+        }
+    }))
+    .expect("init request");
+
+    let mut requests = String::new();
+    requests.push_str(&init);
+    requests.push('\n');
+    requests.push_str(
+        &serde_json::to_string(&json!({
+            "id": 2,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": consumer_uri },
+                "position": { "line": 2, "character": 21 }
+            }
+        }))
+        .expect("definition request"),
+    );
+    requests.push('\n');
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let definition = response_by_id(&responses, 2).expect("definition response");
+    let locations = definition["result"]
+        .as_array()
+        .expect("definition locations");
+    assert!(
+        locations
+            .iter()
+            .any(|location| location["uri"] == producer_uri),
+        "workspace indexing should resolve producer definition: {definition:#?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

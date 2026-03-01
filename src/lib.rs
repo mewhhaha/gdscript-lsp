@@ -5,8 +5,10 @@ pub mod formatter;
 pub mod hover;
 pub mod lint;
 pub mod lsp;
+pub mod parity;
 pub mod parser;
 pub mod project_godot;
+pub mod semantic;
 
 pub use cli::{Cli, Commands, GlobalOptions, LintRuleOverrides};
 pub use code_actions::{
@@ -21,6 +23,7 @@ pub use lint::{
     check_document_with_mode, check_document_with_settings, check_document_with_settings_and_mode,
     rule_ids,
 };
+pub use parity::{build_parity_gap_report, render_parity_gap_report};
 pub use parser::{ParsedScript, ParserError, ScriptDecl, parse_script};
 pub use project_godot::{
     ProjectGodotConfig, load_project_godot_config, parse_project_godot_config,
@@ -202,5 +205,26 @@ pub fn rules_command() -> Result<()> {
     for rule in rule_ids() {
         writeln!(out, "{rule}")?;
     }
+    Ok(())
+}
+
+pub fn parity_report_command(json: bool, strict: bool, limit: usize) -> Result<()> {
+    let report = build_parity_gap_report()?;
+    let mut out = io::stdout();
+
+    if json {
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+    } else {
+        write!(out, "{}", render_parity_gap_report(&report, limit))?;
+    }
+
+    if strict && report.summary.total_gaps() > 0 {
+        return Err(anyhow::anyhow!(
+            "parity gaps found (total={})",
+            report.summary.total_gaps()
+        ));
+    }
+
     Ok(())
 }

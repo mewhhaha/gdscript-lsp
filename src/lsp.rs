@@ -2,19 +2,21 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::code_actions::{CodeAction, CodeActionKind, code_actions_for_diagnostics_and_mode};
 use crate::engine::{BehaviorMode, EngineConfig};
 use crate::formatter::format_gdscript;
-use crate::hover::hover_at;
+use crate::hover::{HoverWorkspaceDoc, definition_uri_for_known_symbol, hover_at_with_workspace};
 use crate::lint::{
     Diagnostic, DiagnosticLevel, LintSettings, check_document_with_settings_and_mode,
 };
 use crate::parser::{ParsedScript, ScriptDeclKind, parse_script};
 use crate::project_godot::load_project_godot_config;
+use crate::semantic::{SemanticDocument, SymbolLocation, SymbolSpan, WorkspaceSemanticIndex};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LspRequest {
@@ -23,37 +25,16 @@ struct LspRequest {
     pub params: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
-struct IndexedDecl {
-    line: usize,
-    start_character: usize,
-    end_character: usize,
-}
-
-#[derive(Debug, Clone)]
-struct LspDocument {
-    source: String,
-    parsed: ParsedScript,
-    symbol_index: HashMap<String, Vec<IndexedDecl>>,
-}
-
 #[derive(Debug, Default)]
 struct LspState {
-    documents: HashMap<String, LspDocument>,
+    workspace_index: WorkspaceSemanticIndex,
+    workspace_roots: Vec<PathBuf>,
     shutdown_received: bool,
 }
 
 impl LspState {
     fn open_document(&mut self, uri: &str, source: &str) {
-        let parsed = parse_script(source, uri);
-        self.documents.insert(
-            uri.to_string(),
-            LspDocument {
-                source: source.to_string(),
-                parsed: parsed.clone(),
-                symbol_index: build_symbol_index(&parsed),
-            },
-        );
+        self.workspace_index.upsert_document(uri, source);
     }
 
     fn change_document(&mut self, uri: &str, source: &str) {
@@ -61,19 +42,163 @@ impl LspState {
     }
 
     fn close_document(&mut self, uri: &str) {
-        self.documents.remove(uri);
+        if !self.reindex_document_from_disk(uri) {
+            self.workspace_index.remove_document(uri);
+        }
     }
 
     fn source_for_uri(&self, uri: &str) -> Option<&str> {
-        self.documents.get(uri).map(|doc| doc.source.as_str())
+        self.workspace_index
+            .get_document(uri)
+            .map(|doc| doc.source.as_str())
     }
 
     fn parsed_for_uri(&self, uri: &str) -> Option<&ParsedScript> {
-        self.documents.get(uri).map(|doc| &doc.parsed)
+        self.workspace_index
+            .get_document(uri)
+            .map(|doc| &doc.parsed)
     }
 
-    fn declarations_by_symbol_for_uri(&self, uri: &str, symbol: &str) -> Option<&Vec<IndexedDecl>> {
-        self.documents.get(uri)?.symbol_index.get(symbol)
+    fn declarations_by_symbol_for_uri(&self, uri: &str, symbol: &str) -> Vec<SymbolLocation> {
+        self.workspace_index
+            .declarations_for_symbol_in_uri(uri, symbol)
+    }
+
+    fn workspace_declarations_for_symbol(&self, symbol: &str) -> Vec<SymbolLocation> {
+        self.workspace_index
+            .workspace_declarations_for_symbol(symbol)
+    }
+
+    fn workspace_occurrences_for_symbol(&self, symbol: &str) -> Vec<SymbolLocation> {
+        self.workspace_index
+            .workspace_occurrences_for_symbol(symbol)
+    }
+
+    fn has_workspace_declaration(&self, symbol: &str) -> bool {
+        self.workspace_index.has_workspace_declaration(symbol)
+    }
+
+    fn workspace_documents(&self) -> impl Iterator<Item = &SemanticDocument> {
+        self.workspace_index.documents()
+    }
+
+    fn configure_workspace_roots(&mut self, params: &Value) {
+        let mut roots = Vec::new();
+
+        if let Some(root_uri) = params.get("rootUri").and_then(Value::as_str)
+            && let Some(path) = file_uri_to_path(root_uri)
+        {
+            roots.push(path);
+        }
+
+        if let Some(workspace_folders) = params.get("workspaceFolders").and_then(Value::as_array) {
+            for folder in workspace_folders {
+                if let Some(uri) = folder.get("uri").and_then(Value::as_str)
+                    && let Some(path) = file_uri_to_path(uri)
+                {
+                    roots.push(path);
+                }
+            }
+        }
+
+        roots.sort();
+        roots.dedup();
+        self.workspace_roots = roots;
+    }
+
+    fn index_workspace_files(&mut self) {
+        let mut files = Vec::new();
+        for root in &self.workspace_roots {
+            collect_gd_files(root, &mut files);
+        }
+
+        files.sort();
+        files.dedup();
+
+        for path in files {
+            if let Ok(source) = fs::read_to_string(&path) {
+                let uri = path_to_file_uri(&path);
+                self.workspace_index.upsert_document(&uri, &source);
+            }
+        }
+    }
+
+    fn apply_watched_file_changes(&mut self, params: &Value) {
+        let Some(changes) = params.get("changes").and_then(Value::as_array) else {
+            return;
+        };
+
+        for change in changes {
+            let Some(uri) = change.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let change_type = change.get("type").and_then(Value::as_u64).unwrap_or(2);
+            if change_type == 3 {
+                self.workspace_index.remove_document(uri);
+                continue;
+            }
+            self.reindex_document_from_disk(uri);
+        }
+    }
+
+    fn reindex_document_from_disk(&mut self, uri: &str) -> bool {
+        let Some(path) = file_uri_to_path(uri) else {
+            return false;
+        };
+
+        if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("gd") {
+            return false;
+        }
+
+        match fs::read_to_string(&path) {
+            Ok(source) => {
+                self.workspace_index.upsert_document(uri, &source);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.starts_with('/') {
+        Some(PathBuf::from(raw))
+    } else {
+        Some(PathBuf::from(format!("/{raw}")))
+    }
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
+}
+
+fn collect_gd_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| matches!(name, ".git" | ".godot" | "target"))
+            {
+                continue;
+            }
+            collect_gd_files(&path, out);
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some("gd") {
+            out.push(path);
+        }
     }
 }
 
@@ -219,48 +344,63 @@ fn handle_request(
     let id = req.id;
 
     let response = match req.method.as_str() {
-        "initialize" => id.map(|id| {
-            json!({
-                "id": id,
-                "result": {
-                    "capabilities": {
-                        "textDocumentSync": 1,
-                        "hoverProvider": true,
-                        "documentFormattingProvider": true,
-                        "diagnosticProvider": {
-                            "interFileDependencies": false,
-                            "workspaceDiagnostics": false
+        "initialize" => {
+            let init_params = req.params.unwrap_or_default();
+            state.configure_workspace_roots(&init_params);
+            state.index_workspace_files();
+            id.map(|id| {
+                json!({
+                    "id": id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "hoverProvider": true,
+                            "documentFormattingProvider": true,
+                            "diagnosticProvider": {
+                                "interFileDependencies": false,
+                                "workspaceDiagnostics": false
+                            },
+                            "codeActionProvider": {
+                                "resolveProvider": true,
+                                "codeActionKinds": ["quickfix", "refactor"]
+                            },
+                            "completionProvider": {
+                                "resolveProvider": false,
+                                "triggerCharacters": ["."]
+                            },
+                            "signatureHelpProvider": {
+                                "triggerCharacters": ["("]
+                            },
+                            "documentSymbolProvider": true,
+                            "documentHighlightProvider": true,
+                            "definitionProvider": true,
+                            "referencesProvider": true,
+                            "renameProvider": {
+                                "prepareProvider": true
+                            },
+                            "workspaceSymbolProvider": true,
+                            "executeCommandProvider": {
+                                "commands": ["gdscript-lsp.showDeclaration"]
+                            }
                         },
-                        "codeActionProvider": {
-                            "resolveProvider": false,
-                            "codeActionKinds": ["quickfix", "refactor"]
-                        },
-                        "completionProvider": {
-                            "resolveProvider": false,
-                            "triggerCharacters": ["."]
-                        },
-                        "signatureHelpProvider": {
-                            "triggerCharacters": ["("]
-                        },
-                        "documentSymbolProvider": true,
-                        "documentHighlightProvider": true,
-                        "definitionProvider": true,
-                        "referencesProvider": true,
-                        "workspaceSymbolProvider": true,
-                    },
-                    "serverInfo": {
-                        "name": "gdscript-lsp",
-                        "version": "0.1.0"
+                        "serverInfo": {
+                            "name": "gdscript-lsp",
+                            "version": "0.1.0"
+                        }
                     }
-                }
+                })
             })
-        }),
+        }
         "initialized"
         | "$/setTrace"
         | "$/cancelRequest"
         | "workspace/didChangeConfiguration"
-        | "workspace/didChangeWatchedFiles"
         | "textDocument/didSave" => None,
+        "workspace/didChangeWatchedFiles" => {
+            let params = req.params.unwrap_or_default();
+            state.apply_watched_file_changes(&params);
+            None
+        }
         "shutdown" => {
             state.shutdown_received = true;
             id.map(|id| json!({"id": id, "result": true}))
@@ -308,8 +448,9 @@ fn handle_request(
             let params = req.params.unwrap_or_default();
             let source = source_from_params(&params, state);
             let (line, character) = extract_position(&params, transport);
+            let request_uri = extract_uri(&params);
 
-            let parsed = if let Some(uri) = extract_uri(&params) {
+            let parsed = if let Some(uri) = request_uri {
                 state
                     .parsed_for_uri(uri)
                     .cloned()
@@ -318,7 +459,21 @@ fn handle_request(
                 parse_script(&source, "stdin://lsp.gd")
             };
 
-            let hover = hover_at(line, character, &parsed);
+            let workspace = state
+                .workspace_documents()
+                .map(|doc| HoverWorkspaceDoc {
+                    uri: doc.uri.as_str(),
+                    script: &doc.parsed,
+                })
+                .collect::<Vec<_>>();
+
+            let hover = hover_at_with_workspace(
+                line,
+                character,
+                &parsed,
+                request_uri,
+                workspace.as_slice(),
+            );
             let result = hover.map_or(Value::Null, |hover| {
                 json!({
                     "contents": {
@@ -365,9 +520,42 @@ fn handle_request(
             let mode = extract_mode(&params).unwrap_or(engine.behavior_mode);
             let diagnostics =
                 check_document_with_settings_and_mode(&source, &resolve_lint_settings(), mode);
-            let actions = code_actions_for_diagnostics_and_mode(&source, &diagnostics, mode);
+            let mut actions = code_actions_for_diagnostics_and_mode(&source, &diagnostics, mode);
+            let (line, character) = extract_action_position(&params, transport);
+
+            if let Some(action) = explicit_type_annotation_action(&source, line) {
+                actions.push(action);
+            }
+            if let Some(action) =
+                declaration_context_action(state, &params, &source, line, character)
+            {
+                actions.push(action);
+            }
+
             let filtered = filter_actions_by_context(actions, &params);
-            id.map(|id| json!({"id": id, "result": filtered}))
+            let action_uri = extract_uri(&params).unwrap_or("stdin://lsp.gd");
+            let lsp_actions = to_lsp_code_actions(&filtered, action_uri, &source, transport);
+            id.map(|id| json!({"id": id, "result": lsp_actions}))
+        }
+        "codeAction/resolve" | "textDocument/codeAction/resolve" => {
+            let params = req.params.unwrap_or_default();
+            let resolved = resolve_code_action(state, params, transport);
+            id.map(|id| json!({"id": id, "result": resolved}))
+        }
+        "workspace/executeCommand" => {
+            let params = req.params.unwrap_or_default();
+            let command = params.get("command").and_then(Value::as_str).unwrap_or("");
+            let result = if command == "gdscript-lsp.showDeclaration" {
+                params
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .and_then(|arguments| arguments.first())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            id.map(|id| json!({ "id": id, "result": result }))
         }
         "textDocument/completion" => {
             let params = req.params.unwrap_or_default();
@@ -401,6 +589,11 @@ fn handle_request(
                     &mut seen,
                 ));
             }
+            items.extend(completion_entries_for_workspace_declarations(
+                state.workspace_documents(),
+                prefix.as_deref(),
+                &mut seen,
+            ));
 
             id.map(|id| json!({"id": id, "result": {"isIncomplete": false, "items": items}}))
         }
@@ -474,12 +667,11 @@ fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            let mut uris: Vec<_> = state.documents.keys().cloned().collect();
-            uris.sort_unstable();
+            let mut docs = state.workspace_documents().collect::<Vec<_>>();
+            docs.sort_by(|a, b| a.uri.cmp(&b.uri));
             let mut symbols = Vec::new();
 
-            for uri in uris {
-                let doc = state.documents.get(&uri).expect("document present");
+            for doc in docs {
                 for decl in &doc.parsed.declarations {
                     let decl_name = decl.name.to_ascii_lowercase();
                     if !query.is_empty() && !decl_name.contains(&query) {
@@ -496,7 +688,7 @@ fn handle_request(
                         "name": decl.name,
                         "kind": declaration_kind_to_symbol_kind(&decl.kind),
                         "location": {
-                            "uri": uri,
+                            "uri": doc.uri,
                             "range": lsp_range(
                                 decl.line,
                                 start_character,
@@ -517,15 +709,19 @@ fn handle_request(
             let source = source_from_params(&params, state);
             let (line, character) = extract_position(&params, transport);
             let symbol = symbol_at_position(&source, line, character);
-            let locations: Vec<_> = uri
-                .and_then(|uri| state.declarations_by_symbol_for_uri(uri, symbol?.as_str()))
-                .map(|symbols| {
-                    symbols
-                        .iter()
-                        .map(|symbol| location_for(uri.unwrap_or(""), symbol, transport))
-                        .collect()
+            let mut locations = symbol
+                .as_deref()
+                .map(|symbol_name| {
+                    definition_locations(state, uri, symbol_name, &source, transport)
                 })
                 .unwrap_or_default();
+
+            if locations.is_empty()
+                && let Some(symbol) = symbol.as_deref()
+                && let Some(doc_uri) = definition_uri_for_known_symbol(symbol)
+            {
+                locations.push(virtual_location_for_uri(&doc_uri, transport));
+            }
 
             let result = if locations.is_empty() {
                 serde_json::Value::Null
@@ -541,17 +737,128 @@ fn handle_request(
             let source = source_from_params(&params, state);
             let (line, character) = extract_position(&params, transport);
             let symbol = symbol_at_position(&source, line, character);
-            let locations = uri
-                .and_then(|uri| state.declarations_by_symbol_for_uri(uri, symbol?.as_str()))
-                .map(|symbols| {
-                    symbols
-                        .iter()
-                        .map(|symbol| location_for(uri.unwrap_or(""), symbol, transport))
-                        .collect::<Vec<_>>()
+            let include_declaration = params
+                .get("context")
+                .and_then(|ctx| ctx.get("includeDeclaration"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let locations = symbol
+                .as_deref()
+                .map(|symbol_name| {
+                    reference_locations(
+                        state,
+                        uri,
+                        symbol_name,
+                        &source,
+                        transport,
+                        include_declaration,
+                    )
                 })
                 .unwrap_or_default();
 
             id.map(|id| json!({"id": id, "result": locations}))
+        }
+        "textDocument/prepareRename" => {
+            let params = req.params.unwrap_or_default();
+            let source = source_from_params(&params, state);
+            let (line, character) = extract_position(&params, transport);
+            let result = symbol_range_at_position(&source, line, character)
+                .and_then(|(symbol, start_character, end_character)| {
+                    if !is_valid_identifier_name(&symbol) {
+                        return None;
+                    }
+                    if definition_uri_for_known_symbol(&symbol).is_some()
+                        && !state.has_workspace_declaration(&symbol)
+                        && !source_declares_symbol(&source, &symbol)
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "range": lsp_range(line, start_character, line, end_character, transport),
+                        "placeholder": symbol,
+                    }))
+                })
+                .unwrap_or(Value::Null);
+
+            id.map(|id| json!({"id": id, "result": result}))
+        }
+        "textDocument/rename" => {
+            let params = req.params.unwrap_or_default();
+            let uri = extract_uri(&params);
+            let source = source_from_params(&params, state);
+            let (line, character) = extract_position(&params, transport);
+            let new_name = params
+                .get("newName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            if !is_valid_identifier_name(&new_name) {
+                let error = json!({
+                    "code": -32602,
+                    "message": "Invalid params: newName must be a valid identifier"
+                });
+                return (id.map(|id| json!({"id": id, "error": error})), None);
+            }
+
+            let result = symbol_range_at_position(&source, line, character)
+                .and_then(|(symbol, _, _)| {
+                    if definition_uri_for_known_symbol(&symbol).is_some()
+                        && !state.has_workspace_declaration(&symbol)
+                        && !source_declares_symbol(&source, &symbol)
+                    {
+                        return None;
+                    }
+
+                    let mut occurrences = state.workspace_occurrences_for_symbol(&symbol);
+                    if occurrences.is_empty() {
+                        let fallback_uri = uri.unwrap_or("stdin://lsp.gd");
+                        occurrences = collect_symbol_occurrences(&source, &symbol)
+                            .into_iter()
+                            .map(|span| SymbolLocation {
+                                uri: fallback_uri.to_string(),
+                                span,
+                            })
+                            .collect();
+                    }
+
+                    if occurrences.is_empty() {
+                        return None;
+                    }
+
+                    let mut changes = serde_json::Map::new();
+                    for (target_uri, spans) in group_locations_by_uri(occurrences) {
+                        let edits = spans
+                            .into_iter()
+                            .map(|span| {
+                                json!({
+                                    "range": lsp_range(
+                                        span.line,
+                                        span.start_character,
+                                        span.line,
+                                        span.end_character,
+                                        transport
+                                    ),
+                                    "newText": new_name.clone()
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if !edits.is_empty() {
+                            changes.insert(target_uri, Value::Array(edits));
+                        }
+                    }
+
+                    if changes.is_empty() {
+                        return None;
+                    }
+
+                    Some(json!({
+                        "changes": Value::Object(changes)
+                    }))
+                })
+                .unwrap_or(Value::Null);
+
+            id.map(|id| json!({"id": id, "result": result}))
         }
         "textDocument/documentSymbol" => {
             let params = req.params.unwrap_or_default();
@@ -681,6 +988,179 @@ fn extract_position(params: &Value, transport: Transport) -> (usize, usize) {
         Transport::Framed => (line.saturating_add(1), character.saturating_add(1)),
         Transport::LineDelimited => (line.max(1), character.max(1)),
     }
+}
+
+fn extract_action_position(params: &Value, transport: Transport) -> (usize, usize) {
+    if let Some(start) = params.get("range").and_then(|range| range.get("start")) {
+        let line = start.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let character = start.get("character").and_then(Value::as_u64).unwrap_or(0) as usize;
+        return match transport {
+            Transport::Framed => (line.saturating_add(1), character.saturating_add(1)),
+            Transport::LineDelimited => (line.max(1), character.max(1)),
+        };
+    }
+    extract_position(params, transport)
+}
+
+fn declaration_context_action(
+    state: &LspState,
+    params: &Value,
+    source: &str,
+    line: usize,
+    character: usize,
+) -> Option<CodeAction> {
+    let symbol = symbol_at_position(source, line, character)?;
+    if !is_valid_identifier_name(&symbol) {
+        return None;
+    }
+
+    let uri = extract_uri(params).unwrap_or("stdin://lsp.gd");
+    let target = declarations_for_symbol(state, Some(uri), &symbol, source)
+        .into_iter()
+        .min_by_key(|decl| decl.line)?;
+    let replacement = state
+        .source_for_uri(uri)
+        .and_then(|doc_source| doc_source.lines().nth(target.line.saturating_sub(1)))
+        .unwrap_or_else(|| {
+            source
+                .lines()
+                .nth(target.line.saturating_sub(1))
+                .unwrap_or_default()
+        })
+        .to_string();
+
+    Some(CodeAction {
+        title: format!("Show declaration context for `{symbol}`"),
+        kind: CodeActionKind::Refactor,
+        patch: crate::code_actions::CodeActionPatch {
+            line: target.line.max(1),
+            replacement: replacement.clone(),
+        },
+        command: Some("gdscript-lsp.showDeclaration".to_string()),
+        data: Some(json!({
+            "resolver": "line-replacement",
+            "uri": uri,
+            "symbol": symbol,
+            "line": target.line,
+            "start_character": target.start_character,
+            "end_character": target.end_character,
+            "replacement": replacement
+        })),
+    })
+}
+
+fn explicit_type_annotation_action(source: &str, line: usize) -> Option<CodeAction> {
+    let current = source.lines().nth(line.saturating_sub(1))?;
+    let (prefix, code, suffix_comment) = split_code_and_comment(current);
+    let trimmed = code.trim_start();
+    let rest = trimmed.strip_prefix("var ")?;
+    let (lhs, rhs) = rest.split_once(":=")?;
+    let name = lhs.trim();
+    if name.contains(':') || !is_valid_identifier_name(name) {
+        return None;
+    }
+    let rhs = rhs.trim();
+    let inferred_type = infer_type_for_annotation(rhs)?;
+    let mut replacement = format!("{prefix}var {name}: {inferred_type} = {rhs}");
+    if let Some(comment) = suffix_comment.filter(|comment| !comment.is_empty()) {
+        replacement.push_str(" # ");
+        replacement.push_str(comment.as_str());
+    }
+    if replacement == current {
+        return None;
+    }
+
+    Some(CodeAction {
+        title: "Add explicit type annotation".to_string(),
+        kind: CodeActionKind::QuickFix,
+        patch: crate::code_actions::CodeActionPatch { line, replacement },
+        command: None,
+        data: None,
+    })
+}
+
+fn split_code_and_comment(line: &str) -> (String, String, Option<String>) {
+    let indent = line
+        .chars()
+        .take_while(|ch| ch.is_ascii_whitespace())
+        .collect::<String>();
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+                if ch == b'\\' {
+                    escaped = true;
+                    idx += 1;
+                    continue;
+                }
+                if ch == q {
+                    quote = None;
+                }
+                idx += 1;
+            }
+            None => {
+                if ch == b'\'' || ch == b'"' {
+                    quote = Some(ch);
+                    idx += 1;
+                    continue;
+                }
+                if ch == b'#' {
+                    let code = line[..idx].trim_end().to_string();
+                    let comment = line[idx + 1..].trim().to_string();
+                    return (indent, code, Some(comment));
+                }
+                idx += 1;
+            }
+        }
+    }
+    (indent, line.trim_end().to_string(), None)
+}
+
+fn infer_type_for_annotation(expr: &str) -> Option<String> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    if expr.parse::<i64>().is_ok() {
+        return Some("int".to_string());
+    }
+    if expr.parse::<f64>().is_ok() {
+        return Some("float".to_string());
+    }
+    if expr == "true" || expr == "false" {
+        return Some("bool".to_string());
+    }
+    if (expr.starts_with('"') && expr.ends_with('"'))
+        || (expr.starts_with('\'') && expr.ends_with('\''))
+    {
+        return Some("String".to_string());
+    }
+    if (expr.starts_with("&\"") && expr.ends_with('"'))
+        || (expr.starts_with("&'") && expr.ends_with('\''))
+    {
+        return Some("StringName".to_string());
+    }
+    if expr.starts_with('[') && expr.ends_with(']') {
+        return Some("Array".to_string());
+    }
+    if expr.starts_with('{') && expr.ends_with('}') {
+        return Some("Dictionary".to_string());
+    }
+    if let Some(class_name) = expr.strip_suffix(".new()")
+        && is_valid_identifier_name(class_name.trim())
+    {
+        return Some(class_name.trim().to_string());
+    }
+    None
 }
 
 fn extract_mode(params: &Value) -> Option<BehaviorMode> {
@@ -874,20 +1354,122 @@ fn completion_entries_for_declarations(
         .collect()
 }
 
+fn completion_entries_for_workspace_declarations<'a>(
+    documents: impl Iterator<Item = &'a SemanticDocument>,
+    prefix: Option<&str>,
+    seen: &mut HashSet<String>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for doc in documents {
+        out.extend(completion_entries_for_declarations(
+            &doc.parsed.declarations,
+            prefix,
+            seen,
+        ));
+    }
+    out
+}
+
+fn to_lsp_code_actions(
+    actions: &[CodeAction],
+    uri: &str,
+    source: &str,
+    transport: Transport,
+) -> Vec<Value> {
+    actions
+        .iter()
+        .map(|action| {
+            let line = action.patch.line.max(1);
+            let line_text = source
+                .lines()
+                .nth(line.saturating_sub(1))
+                .unwrap_or_default();
+            let end_column = line_text.len().saturating_add(1);
+            let mut changes = serde_json::Map::new();
+            changes.insert(
+                uri.to_string(),
+                Value::Array(vec![json!({
+                    "range": lsp_range(line, 1, line, end_column, transport),
+                    "newText": action.patch.replacement
+                })]),
+            );
+
+            let kind = match action.kind {
+                CodeActionKind::QuickFix => "quickfix",
+                CodeActionKind::Refactor => "refactor.rewrite",
+            };
+
+            let lazy_resolve = action
+                .data
+                .as_ref()
+                .and_then(|data| data.get("resolver"))
+                .is_some();
+
+            let mut payload = json!({
+                "title": action.title,
+                "kind": kind
+            });
+
+            if !lazy_resolve {
+                payload["edit"] = json!({
+                    "changes": Value::Object(changes)
+                });
+            }
+
+            if let Some(command_name) = &action.command {
+                let arguments = action
+                    .data
+                    .clone()
+                    .map(|data| vec![data])
+                    .unwrap_or_default();
+                payload["command"] = json!({
+                    "title": action.title,
+                    "command": command_name,
+                    "arguments": arguments
+                });
+            }
+
+            if let Some(data) = &action.data {
+                payload["data"] = data.clone();
+            }
+
+            payload
+        })
+        .collect()
+}
+
 fn declarations_for_symbol(
     state: &LspState,
     uri: Option<&str>,
     symbol: &str,
     source: &str,
-) -> Vec<IndexedDecl> {
-    uri.and_then(|uri| state.declarations_by_symbol_for_uri(uri, symbol).cloned())
-        .unwrap_or_else(|| {
-            let parsed = parse_script(source, uri.unwrap_or("stdin://lsp.gd"));
-            build_symbol_index(&parsed)
-                .get(symbol)
-                .cloned()
-                .unwrap_or_default()
+) -> Vec<SymbolSpan> {
+    if let Some(uri) = uri {
+        let local = state.declarations_by_symbol_for_uri(uri, symbol);
+        if !local.is_empty() {
+            return local.into_iter().map(|loc| loc.span).collect();
+        }
+    }
+
+    let parsed = parse_script(source, uri.unwrap_or("stdin://lsp.gd"));
+    parsed
+        .declarations
+        .iter()
+        .filter(|decl| decl.name == symbol)
+        .map(|decl| {
+            let line_text = parsed
+                .lines
+                .get(decl.line.saturating_sub(1))
+                .map(String::as_str)
+                .unwrap_or("");
+            let (start_character, end_character) = declaration_name_range(line_text, &decl.name);
+            SymbolSpan {
+                line: decl.line,
+                start_character,
+                end_character,
+            }
         })
+        .collect()
 }
 
 fn function_signature_parameters(signature_line: &str) -> Vec<Value> {
@@ -911,7 +1493,7 @@ fn function_signature_parameters(signature_line: &str) -> Vec<Value> {
     Vec::new()
 }
 
-fn range_for_decl(decl: &IndexedDecl, transport: Transport) -> Value {
+fn range_for_decl(decl: &SymbolSpan, transport: Transport) -> Value {
     lsp_range(
         decl.line,
         decl.start_character,
@@ -963,28 +1545,6 @@ fn declaration_kind_to_symbol_kind(kind: &ScriptDeclKind) -> u32 {
     }
 }
 
-fn build_symbol_index(parsed: &ParsedScript) -> HashMap<String, Vec<IndexedDecl>> {
-    parsed
-        .declarations
-        .iter()
-        .fold(HashMap::new(), |mut acc, declaration| {
-            let line_text = parsed
-                .lines
-                .get(declaration.line.saturating_sub(1))
-                .map(String::as_str)
-                .unwrap_or("");
-            let (start_character, end_character) =
-                declaration_name_range(line_text, &declaration.name);
-            let entry = IndexedDecl {
-                line: declaration.line,
-                start_character,
-                end_character,
-            };
-            acc.entry(declaration.name.clone()).or_default().push(entry);
-            acc
-        })
-}
-
 fn declaration_name_range(line_text: &str, name: &str) -> (usize, usize) {
     if name.is_empty() {
         return (1, 1);
@@ -999,6 +1559,14 @@ fn declaration_name_range(line_text: &str, name: &str) -> (usize, usize) {
 }
 
 fn symbol_at_position(source: &str, line: usize, character: usize) -> Option<String> {
+    symbol_range_at_position(source, line, character).map(|(symbol, _, _)| symbol)
+}
+
+fn symbol_range_at_position(
+    source: &str,
+    line: usize,
+    character: usize,
+) -> Option<(String, usize, usize)> {
     let line_idx = line.saturating_sub(1);
     let line_text = source.lines().nth(line_idx)?;
     if line_text.is_empty() {
@@ -1031,10 +1599,112 @@ fn symbol_at_position(source: &str, line: usize, character: usize) -> Option<Str
         end += 1;
     }
 
-    Some(line_text[start..=end].to_string())
+    let start_character = start.saturating_add(1);
+    let end_character = end.saturating_add(2);
+    Some((
+        line_text[start..=end].to_string(),
+        start_character,
+        end_character,
+    ))
 }
 
-fn location_for(uri: &str, decl: &IndexedDecl, transport: Transport) -> Value {
+fn collect_symbol_occurrences(source: &str, symbol: &str) -> Vec<SymbolSpan> {
+    if symbol.is_empty() {
+        return Vec::new();
+    }
+
+    let mut occurrences = Vec::new();
+    let symbol_bytes = symbol.as_bytes();
+    let mut quote = None::<u8>;
+    let mut escaped = false;
+    let mut triple = false;
+
+    for (line_idx, line_text) in source.lines().enumerate() {
+        let bytes = line_text.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+                if triple
+                    && idx + 2 < bytes.len()
+                    && bytes[idx] == q
+                    && bytes[idx + 1] == q
+                    && bytes[idx + 2] == q
+                {
+                    quote = None;
+                    triple = false;
+                    idx += 3;
+                    continue;
+                }
+                if bytes[idx] == b'\\' && !triple {
+                    escaped = true;
+                } else if bytes[idx] == q && !triple {
+                    quote = None;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if bytes[idx] == b'#' {
+                break;
+            }
+
+            if bytes[idx] == b'\'' || bytes[idx] == b'"' {
+                quote = Some(bytes[idx]);
+                triple = idx + 2 < bytes.len()
+                    && bytes[idx + 1] == bytes[idx]
+                    && bytes[idx + 2] == bytes[idx];
+                idx += if triple { 3 } else { 1 };
+                continue;
+            }
+
+            if is_identifier_char(bytes[idx]) {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && is_identifier_char(bytes[idx]) {
+                    idx += 1;
+                }
+                if &bytes[start..idx] == symbol_bytes {
+                    let start_character = start.saturating_add(1);
+                    let end_character = idx.saturating_add(1);
+                    occurrences.push(SymbolSpan {
+                        line: line_idx.saturating_add(1),
+                        start_character,
+                        end_character,
+                    });
+                }
+                continue;
+            }
+
+            idx += 1;
+        }
+
+        if quote.is_some() && !triple {
+            quote = None;
+            escaped = false;
+        }
+    }
+
+    occurrences
+}
+
+fn is_valid_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn location_for(uri: &str, decl: &SymbolSpan, transport: Transport) -> Value {
     json!({
         "uri": uri,
         "range": lsp_range(
@@ -1044,6 +1714,204 @@ fn location_for(uri: &str, decl: &IndexedDecl, transport: Transport) -> Value {
             decl.end_character,
             transport
         )
+    })
+}
+
+fn definition_locations(
+    state: &LspState,
+    uri: Option<&str>,
+    symbol: &str,
+    source: &str,
+    transport: Transport,
+) -> Vec<Value> {
+    let mut locations = if let Some(uri) = uri {
+        let mut local = state.declarations_by_symbol_for_uri(uri, symbol);
+        if local.is_empty() {
+            local = state.workspace_declarations_for_symbol(symbol);
+        }
+        local
+    } else {
+        state.workspace_declarations_for_symbol(symbol)
+    };
+
+    if locations.is_empty() {
+        let fallback_uri = uri.unwrap_or("stdin://lsp.gd").to_string();
+        locations = declarations_for_symbol(state, uri, symbol, source)
+            .into_iter()
+            .map(|span| SymbolLocation {
+                uri: fallback_uri.clone(),
+                span,
+            })
+            .collect();
+    }
+
+    locations.sort_by(|a, b| {
+        let preferred_a = uri.is_some_and(|current| current == a.uri);
+        let preferred_b = uri.is_some_and(|current| current == b.uri);
+        preferred_b
+            .cmp(&preferred_a)
+            .then_with(|| a.uri.cmp(&b.uri))
+            .then_with(|| a.span.line.cmp(&b.span.line))
+            .then_with(|| a.span.start_character.cmp(&b.span.start_character))
+    });
+
+    locations
+        .into_iter()
+        .map(|location| location_for(&location.uri, &location.span, transport))
+        .collect()
+}
+
+fn reference_locations(
+    state: &LspState,
+    uri: Option<&str>,
+    symbol: &str,
+    source: &str,
+    transport: Transport,
+    include_declaration: bool,
+) -> Vec<Value> {
+    let mut refs = state.workspace_occurrences_for_symbol(symbol);
+
+    if refs.is_empty() {
+        let fallback_uri = uri.unwrap_or("stdin://lsp.gd");
+        refs = collect_symbol_occurrences(source, symbol)
+            .into_iter()
+            .map(|span| SymbolLocation {
+                uri: fallback_uri.to_string(),
+                span,
+            })
+            .collect();
+    }
+
+    if !include_declaration {
+        let declaration_keys = state
+            .workspace_declarations_for_symbol(symbol)
+            .into_iter()
+            .map(|decl| {
+                (
+                    decl.uri,
+                    decl.span.line,
+                    decl.span.start_character,
+                    decl.span.end_character,
+                )
+            })
+            .collect::<HashSet<_>>();
+        refs.retain(|location| {
+            !declaration_keys.contains(&(
+                location.uri.clone(),
+                location.span.line,
+                location.span.start_character,
+                location.span.end_character,
+            ))
+        });
+    }
+
+    refs.sort_by(|a, b| {
+        a.uri
+            .cmp(&b.uri)
+            .then_with(|| a.span.line.cmp(&b.span.line))
+            .then_with(|| a.span.start_character.cmp(&b.span.start_character))
+    });
+
+    refs.into_iter()
+        .map(|location| location_for(&location.uri, &location.span, transport))
+        .collect()
+}
+
+fn group_locations_by_uri(locations: Vec<SymbolLocation>) -> HashMap<String, Vec<SymbolSpan>> {
+    let mut out: HashMap<String, Vec<SymbolSpan>> = HashMap::new();
+    for location in locations {
+        out.entry(location.uri).or_default().push(location.span);
+    }
+    for spans in out.values_mut() {
+        spans.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then_with(|| a.start_character.cmp(&b.start_character))
+                .then_with(|| a.end_character.cmp(&b.end_character))
+        });
+    }
+    out
+}
+
+fn source_declares_symbol(source: &str, symbol: &str) -> bool {
+    let parsed = parse_script(source, "stdin://source-check.gd");
+    parsed.declarations.iter().any(|decl| decl.name == symbol)
+}
+
+fn resolve_code_action(state: &LspState, mut action: Value, transport: Transport) -> Value {
+    let data = action.get("data").cloned();
+    if action.get("edit").is_some() {
+        return action;
+    }
+
+    let Some(data) = data else {
+        return action;
+    };
+    let resolver = data.get("resolver").and_then(Value::as_str).unwrap_or("");
+    if resolver != "line-replacement" {
+        return action;
+    }
+
+    let uri = data
+        .get("uri")
+        .and_then(Value::as_str)
+        .unwrap_or("stdin://lsp.gd");
+    let line = data.get("line").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+    let replacement = data
+        .get("replacement")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            state.source_for_uri(uri).map(|source| {
+                source
+                    .lines()
+                    .nth(line.saturating_sub(1))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        })
+        .unwrap_or_default();
+
+    if replacement.is_empty() {
+        return action;
+    }
+
+    let source_line = state
+        .source_for_uri(uri)
+        .and_then(|source| source.lines().nth(line.saturating_sub(1)))
+        .unwrap_or_default();
+    let end_column = source_line.len().saturating_add(1);
+    let mut changes = serde_json::Map::new();
+    changes.insert(
+        uri.to_string(),
+        Value::Array(vec![json!({
+            "range": lsp_range(line, 1, line, end_column, transport),
+            "newText": replacement
+        })]),
+    );
+    action["edit"] = json!({
+        "changes": Value::Object(changes)
+    });
+    action
+}
+
+fn virtual_location_for_uri(uri: &str, transport: Transport) -> Value {
+    let (line, character) = match transport {
+        Transport::Framed => (0, 0),
+        Transport::LineDelimited => (1, 1),
+    };
+    json!({
+        "uri": uri,
+        "range": {
+            "start": {
+                "line": line,
+                "character": character,
+            },
+            "end": {
+                "line": line,
+                "character": character,
+            }
+        }
     })
 }
 
