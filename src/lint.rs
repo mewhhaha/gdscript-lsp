@@ -89,7 +89,7 @@ const RULE_REDUNDANT_AWAIT: &str = "redundant-await";
 impl Default for LintSettings {
     fn default() -> Self {
         Self {
-            max_line_length: 120,
+            max_line_length: 100,
             allow_tabs: false,
             require_spaces_around_operators: true,
             forbid_trailing_whitespace: true,
@@ -196,6 +196,7 @@ fn check_document_with_mode_and_settings(
 ) -> DiagnosticCollection {
     let mut diagnostics = Vec::new();
     let normalized = source.replace('\r', "");
+    let continuation_depths = line_start_delimiter_depths(&normalized);
     let has_code = normalized
         .lines()
         .map(|line| line.trim())
@@ -217,6 +218,11 @@ fn check_document_with_mode_and_settings(
     for (line_idx, line) in normalized.lines().enumerate() {
         let line_number = line_idx + 1;
         let trimmed = line.trim();
+        let in_continuation = continuation_depths
+            .get(line_idx)
+            .copied()
+            .unwrap_or_default()
+            > 0;
 
         if settings.forbid_trailing_whitespace
             && (line.ends_with(' ') || line.ends_with('\t'))
@@ -293,7 +299,8 @@ fn check_document_with_mode_and_settings(
             }
         }
 
-        if let Some(level) = settings.rule_level(RULE_STANDALONE_TERNARY, mode) {
+        if !in_continuation && let Some(level) = settings.rule_level(RULE_STANDALONE_TERNARY, mode)
+        {
             if is_standalone_ternary(trimmed) {
                 diagnostics.push(Diagnostic {
                     file: None,
@@ -307,7 +314,9 @@ fn check_document_with_mode_and_settings(
             }
         }
 
-        if let Some(level) = settings.rule_level(RULE_STANDALONE_EXPRESSION, mode) {
+        if !in_continuation
+            && let Some(level) = settings.rule_level(RULE_STANDALONE_EXPRESSION, mode)
+        {
             if is_standalone_expression(trimmed) {
                 diagnostics.push(Diagnostic {
                     file: None,
@@ -536,6 +545,84 @@ fn check_document_with_mode_and_settings(
     }
 
     diagnostics
+}
+
+fn line_start_delimiter_depths(source: &str) -> Vec<usize> {
+    let mut depths = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut square_depth = 0usize;
+    let mut curly_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut triple = false;
+
+    for line in source.lines() {
+        depths.push(paren_depth + square_depth + curly_depth);
+
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let ch = bytes[idx];
+
+            if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+
+                if triple
+                    && idx + 2 < bytes.len()
+                    && bytes[idx] == q
+                    && bytes[idx + 1] == q
+                    && bytes[idx + 2] == q
+                {
+                    quote = None;
+                    triple = false;
+                    idx += 3;
+                    continue;
+                }
+
+                if ch == b'\\' && !triple {
+                    escaped = true;
+                } else if ch == q && !triple {
+                    quote = None;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if ch == b'#' {
+                break;
+            }
+
+            if ch == b'\'' || ch == b'"' {
+                quote = Some(ch);
+                triple = idx + 2 < bytes.len() && bytes[idx + 1] == ch && bytes[idx + 2] == ch;
+                idx += if triple { 3 } else { 1 };
+                continue;
+            }
+
+            match ch {
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = paren_depth.saturating_sub(1),
+                b'[' => square_depth += 1,
+                b']' => square_depth = square_depth.saturating_sub(1),
+                b'{' => curly_depth += 1,
+                b'}' => curly_depth = curly_depth.saturating_sub(1),
+                _ => {}
+            }
+
+            idx += 1;
+        }
+
+        if quote.is_some() && !triple {
+            quote = None;
+            escaped = false;
+        }
+    }
+
+    depths
 }
 
 fn find_integer_division_column(line: &str) -> Option<usize> {
@@ -3922,7 +4009,7 @@ fn default_level_for_rule(rule_code: &str) -> Option<DiagnosticLevel> {
     match rule_code {
         RULE_TRAILING_WHITESPACE => Some(DiagnosticLevel::Warning),
         RULE_NO_TABS => Some(DiagnosticLevel::Warning),
-        RULE_MAX_LINE_LENGTH => Some(DiagnosticLevel::Info),
+        RULE_MAX_LINE_LENGTH => Some(DiagnosticLevel::Off),
         RULE_SPACES_AROUND_OPERATOR => Some(DiagnosticLevel::Warning),
         RULE_TODO_COMMENT => Some(DiagnosticLevel::Info),
         RULE_EMPTY_FILE => Some(DiagnosticLevel::Warning),
@@ -4176,6 +4263,35 @@ mod tests {
     }
 
     #[test]
+    fn max_line_length_is_off_by_default() {
+        let source = "func long_line() -> void:\n    var value = \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"\n";
+        let diagnostics = check_document_with_settings(source, &LintSettings::default());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != "max-line-length"),
+            "max-line-length should be disabled by default: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn max_line_length_can_be_enabled_by_severity_override() {
+        let source = "func long_line() -> void:\n    var value = \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"\n";
+        let mut settings = LintSettings::default();
+        settings.rule_severities.insert(
+            "max-line-length".to_string(),
+            super::DiagnosticLevel::Warning,
+        );
+        let diagnostics = check_document_with_settings(source, &settings);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == "max-line-length"),
+            "max-line-length should be emitted when explicitly enabled: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn return_value_discarded_is_off_by_default() {
         let source =
             "func i_return_int() -> int:\n    return 4\n\nfunc test():\n    i_return_int()\n";
@@ -4215,6 +4331,18 @@ mod tests {
         assert!(
             standalone >= 2,
             "expected standalone-expression warnings, got {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn standalone_expression_ignores_multiline_call_arguments() {
+        let source = "func test() -> void:\n    _impact_sfx.pitch_scale = clampf(\n        lerpf(impact_pitch_min, impact_pitch_max, intensity) + random_pitch_offset,\n        0.1,\n        4.0\n    )\n";
+        let diagnostics = check_document_with_settings(source, &LintSettings::default());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != "standalone-expression"),
+            "multiline call args should not be flagged as standalone-expression: {diagnostics:#?}"
         );
     }
 

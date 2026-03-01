@@ -449,6 +449,49 @@ fn hover_on_chained_typed_receiver_method_uses_docs_metadata() {
 }
 
 #[test]
+fn hover_on_property_chain_uses_typed_receiver_for_property_and_method() {
+    let property_output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\\n    _player.stream.get_length()\\n\",\"line\":3,\"character\":14}}\n{\"method\":\"exit\"}\n",
+    );
+    assert!(
+        property_output.contains("AudioStreamPlayer property stream: AudioStream"),
+        "output: {property_output}"
+    );
+    assert!(
+        property_output.contains("Type: `AudioStream`"),
+        "output: {property_output}"
+    );
+
+    let method_output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\\n    _player.stream.get_length()\\n\",\"line\":3,\"character\":21}}\n{\"method\":\"exit\"}\n",
+    );
+    assert!(
+        method_output.contains("AudioStream method get_length() -> float"),
+        "output: {method_output}"
+    );
+    assert!(
+        !method_output.contains("ambiguous method"),
+        "method hover should not be ambiguous: {method_output}"
+    );
+}
+
+#[test]
+fn hover_on_property_inside_call_argument_keeps_member_symbol() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _impact_sfx: AudioStreamPlayer = AudioStreamPlayer.new()\\n    var max_offset := maxf(_impact_sfx.stream.get_length() - 0.001, 0.0)\\n\",\"line\":3,\"character\":40}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("AudioStreamPlayer property stream: AudioStream"),
+        "output: {output}"
+    );
+    assert!(
+        !output.contains("var max_offset"),
+        "hover should not backtrack to assignment target: {output}"
+    );
+}
+
+#[test]
 fn hover_on_ambiguous_method_reports_candidates() {
     let output = run_lsp(
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    clear()\\n\",\"line\":2,\"character\":7}}\n{\"method\":\"exit\"}\n",

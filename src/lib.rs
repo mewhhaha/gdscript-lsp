@@ -10,6 +10,7 @@ pub mod parity;
 pub mod parser;
 pub mod project_godot;
 pub mod semantic;
+pub mod type_system;
 
 pub use cli::{Cli, Commands, GlobalOptions, LintRuleOverrides};
 pub use code_actions::{

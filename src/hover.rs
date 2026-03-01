@@ -1,7 +1,9 @@
-use crate::docs_meta::{
-    builtin_meta_header, class_meta_header, node_method_meta_header, validate_metadata_headers,
-};
+use crate::docs_meta::{class_meta_header, node_method_meta_header, validate_metadata_headers};
 use crate::parser::{ParsedScript, ScriptDecl, ScriptDeclKind};
+use crate::type_system::{
+    infer_expression_type as infer_expression_type_ts, infer_literal_type, infer_symbol_type,
+    property_signature_for_receiver,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -97,11 +99,23 @@ pub fn hover_at_with_workspace(
         }
 
         if let Some(decl) = best_matching_decl(script, &symbol, line) {
-            return Some(declaration_hover(decl, script, None));
+            let resolved_type = infer_symbol_type(script, &symbol, line);
+            return Some(declaration_hover(
+                decl,
+                script,
+                None,
+                resolved_type.as_deref(),
+            ));
         }
 
         if let Some(inline_decl) = best_inline_binding_decl(script, &symbol, line) {
-            return Some(declaration_hover(&inline_decl, script, None));
+            let resolved_type = infer_symbol_type(script, &symbol, line);
+            return Some(declaration_hover(
+                &inline_decl,
+                script,
+                None,
+                resolved_type.as_deref(),
+            ));
         }
 
         if let Some(enum_decl) = find_enum_decl(script, &symbol) {
@@ -111,7 +125,7 @@ pub fn hover_at_with_workspace(
         if let Some((uri, decl, doc_script)) =
             best_workspace_decl(&symbol, type_context, current_uri, workspace)
         {
-            return Some(declaration_hover(decl, doc_script, Some(uri)));
+            return Some(declaration_hover(decl, doc_script, Some(uri), None));
         }
 
         if let Some((uri, enum_decl, doc_script)) =
@@ -141,7 +155,7 @@ pub fn hover_at_with_workspace(
         .declarations
         .iter()
         .find(|decl| decl.line == line)
-        .map(|decl| declaration_hover(decl, script, None))
+        .map(|decl| declaration_hover(decl, script, None, None))
 }
 
 pub fn definition_uri_for_known_symbol(name: &str) -> Option<String> {
@@ -151,7 +165,9 @@ pub fn definition_uri_for_known_symbol(name: &str) -> Option<String> {
 }
 
 pub fn definition_uris_for_known_symbol(name: &str, receiver_type: Option<&str>) -> Vec<String> {
-    if builtin_hover_metadata().contains_key(name) || matches!(name, "print" | "preload" | "len") {
+    if crate::type_system::builtin_signature(name).is_some()
+        || matches!(name, "print" | "preload" | "len")
+    {
         return vec![globalscope_doc_uri(name)];
     }
 
@@ -171,10 +187,21 @@ pub fn definition_uris_for_known_symbol(name: &str, receiver_type: Option<&str>)
             .collect();
     }
 
+    if let Some(receiver_type) = receiver_type
+        && let Some(property) = property_signature_for_receiver(receiver_type, name)
+    {
+        return vec![class_property_doc_uri(&property.class_name, &property.name)];
+    }
+
     known_type_doc_uri(name).into_iter().collect()
 }
 
-fn declaration_hover(decl: &ScriptDecl, script: &ParsedScript, uri: Option<&str>) -> Hover {
+fn declaration_hover(
+    decl: &ScriptDecl,
+    script: &ParsedScript,
+    uri: Option<&str>,
+    inferred_type: Option<&str>,
+) -> Hover {
     let summary = summarize_declaration(decl, script);
     let source_label = uri
         .map(str::to_string)
@@ -185,10 +212,11 @@ fn declaration_hover(decl: &ScriptDecl, script: &ParsedScript, uri: Option<&str>
         ScriptDeclKind::Variable | ScriptDeclKind::Constant
     ) {
         let mut sections = Vec::new();
+        let display_type = inferred_type.or(summary.decl_type.as_deref());
         let snippet = binding_declaration_snippet(
             decl.kind,
             &decl.name,
-            summary.decl_type.as_deref(),
+            display_type,
             summary.value.as_deref(),
         );
         sections.push(format!("```gdscript\n{snippet}\n```"));
@@ -530,7 +558,7 @@ fn parse_binding_type_and_value(code_line: &str) -> (Option<String>, Option<Stri
 
     let inferred_type = declared_type
         .clone()
-        .or_else(|| value.as_deref().and_then(infer_type_from_expression));
+        .or_else(|| value.as_deref().and_then(infer_literal_type));
 
     (inferred_type, value)
 }
@@ -683,47 +711,6 @@ fn function_return_type(signature_line: &str) -> Option<String> {
     } else {
         Some(ty.to_string())
     }
-}
-
-fn infer_type_from_expression(expr: &str) -> Option<String> {
-    let expr = expr.trim();
-    if expr.is_empty() {
-        return None;
-    }
-
-    if expr == "true" || expr == "false" {
-        return Some("bool".to_string());
-    }
-    if expr == "null" {
-        return Some("Variant".to_string());
-    }
-    if expr.parse::<i64>().is_ok() {
-        return Some("int".to_string());
-    }
-    if expr.parse::<f64>().is_ok() {
-        return Some("float".to_string());
-    }
-    if (expr.starts_with('"') && expr.ends_with('"'))
-        || (expr.starts_with('\'') && expr.ends_with('\''))
-    {
-        return Some("String".to_string());
-    }
-    if (expr.starts_with("&\"") && expr.ends_with('"'))
-        || (expr.starts_with("&'") && expr.ends_with('\''))
-    {
-        return Some("StringName".to_string());
-    }
-    if expr.starts_with('[') && expr.ends_with(']') {
-        return Some("Array".to_string());
-    }
-    if expr.starts_with('{') && expr.ends_with('}') {
-        return Some("Dictionary".to_string());
-    }
-    if let Some(type_name) = constructor_type_from_expression(expr) {
-        return Some(type_name);
-    }
-
-    None
 }
 
 fn declaration_comments(script: &ParsedScript, line: usize) -> Option<String> {
@@ -944,12 +931,7 @@ fn parameter_hover(script: &ParsedScript, symbol: &str, line: usize) -> Option<H
     let param_type = param
         .param_type
         .clone()
-        .or_else(|| {
-            param
-                .default_value
-                .as_deref()
-                .and_then(infer_type_from_expression)
-        })
+        .or_else(|| param.default_value.as_deref().and_then(infer_literal_type))
         .unwrap_or_else(|| "Variant".to_string());
     sections.push(format!("Type: `{param_type}`"));
     if let Some(default_value) = &param.default_value {
@@ -1201,10 +1183,10 @@ fn is_type_context(line_text: &str, symbol_start: usize) -> bool {
 }
 
 fn known_symbol_hover(name: &str, receiver_type: Option<&str>) -> Option<Hover> {
-    if let Some((signature, body)) = builtin_hover_metadata().get(name) {
+    if let Some((signature, body)) = crate::type_system::builtin_signature(name) {
         return Some(Hover {
             title: format!("builtin {signature}"),
-            body: body.clone(),
+            body,
         });
     }
 
@@ -1229,6 +1211,23 @@ fn known_symbol_hover(name: &str, receiver_type: Option<&str>) -> Option<Hover> 
         return Some(Hover {
             title: format!("{} method {}", method.class_name, method.signature),
             body: normalize_godot_bbcode(&method.hover),
+        });
+    }
+
+    if let Some(receiver_type) = receiver_type
+        && let Some(property) = property_signature_for_receiver(receiver_type, name)
+    {
+        let mut body_sections = vec![format!("Type: `{}`", property.property_type)];
+        if !property.documentation.trim().is_empty() {
+            body_sections.push(normalize_godot_bbcode(&property.documentation));
+        }
+
+        return Some(Hover {
+            title: format!(
+                "{} property {}: {}",
+                property.class_name, property.name, property.property_type
+            ),
+            body: body_sections.join("\n\n"),
         });
     }
 
@@ -1324,7 +1323,7 @@ fn receiver_type_for_member_access(
     line: usize,
 ) -> Option<String> {
     let receiver_expr = member_access_receiver_expression(line_text, symbol_start)?;
-    resolve_type_from_expression(script, &receiver_expr, line)
+    infer_expression_type_ts(script, &receiver_expr, line)
 }
 
 fn member_access_receiver_expression(line_text: &str, symbol_start: usize) -> Option<String> {
@@ -1342,8 +1341,74 @@ fn member_access_receiver_expression(line_text: &str, symbol_start: usize) -> Op
     }
     let dot_idx = idx - 1;
     let receiver_prefix = &line_text[..dot_idx];
-    let start = expression_start_index(receiver_prefix);
-    let expr = receiver_prefix[start..].trim();
+    let expr = trailing_receiver_expression(receiver_prefix)?;
+    if expr.is_empty() { None } else { Some(expr) }
+}
+
+fn trailing_receiver_expression(prefix: &str) -> Option<String> {
+    let bytes = prefix.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let mut start = end;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+
+    while start > 0 {
+        let ch = bytes[start - 1];
+
+        if ch == b')' {
+            paren_depth += 1;
+            start -= 1;
+            continue;
+        }
+        if ch == b'(' {
+            if paren_depth > 0 {
+                paren_depth -= 1;
+                start -= 1;
+                continue;
+            }
+            break;
+        }
+        if ch == b']' {
+            bracket_depth += 1;
+            start -= 1;
+            continue;
+        }
+        if ch == b'[' {
+            if bracket_depth > 0 {
+                bracket_depth -= 1;
+                start -= 1;
+                continue;
+            }
+            break;
+        }
+        if paren_depth > 0 || bracket_depth > 0 {
+            start -= 1;
+            continue;
+        }
+
+        if is_ident_char(ch) || matches!(ch, b'.' | b':' | b'$' | b'%') {
+            start -= 1;
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            break;
+        }
+
+        break;
+    }
+
+    let expr = prefix[start..end].trim();
     if expr.is_empty() {
         None
     } else {
@@ -1351,463 +1416,19 @@ fn member_access_receiver_expression(line_text: &str, symbol_start: usize) -> Op
     }
 }
 
-fn expression_start_index(prefix: &str) -> usize {
-    let bytes = prefix.as_bytes();
-    let mut idx = 0usize;
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    let mut brace = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
-    let mut start = 0usize;
-
-    while idx < bytes.len() {
-        let ch = bytes[idx];
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-                idx += 1;
-                continue;
-            }
-            if ch == b'\\' {
-                escaped = true;
-                idx += 1;
-                continue;
-            }
-            if ch == q {
-                quote = None;
-            }
-            idx += 1;
-            continue;
-        }
-
-        if ch == b'\'' || ch == b'"' {
-            quote = Some(ch);
-            idx += 1;
-            continue;
-        }
-
-        match ch {
-            b'(' => paren += 1,
-            b')' => paren = paren.saturating_sub(1),
-            b'[' => bracket += 1,
-            b']' => bracket = bracket.saturating_sub(1),
-            b'{' => brace += 1,
-            b'}' => brace = brace.saturating_sub(1),
-            b';' | b',' if paren == 0 && bracket == 0 && brace == 0 => start = idx + 1,
-            _ if paren == 0 && bracket == 0 && brace == 0 && is_expression_boundary(ch) => {
-                start = idx + 1;
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    start
-}
-
-fn is_expression_boundary(ch: u8) -> bool {
-    matches!(
-        ch,
-        b'=' | b'+'
-            | b'-'
-            | b'*'
-            | b'/'
-            | b'%'
-            | b'!'
-            | b'&'
-            | b'|'
-            | b'^'
-            | b'<'
-            | b'>'
-            | b':'
-            | b'?'
-    )
-}
-
-fn resolve_type_from_expression(script: &ParsedScript, expr: &str, line: usize) -> Option<String> {
-    let segments = split_member_chain(expr);
-    let mut current_type = base_segment_type(script, segments.first()?.trim(), line)?;
-    if segments.len() <= 1 {
-        return Some(current_type);
-    }
-
-    for segment in segments.iter().skip(1) {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            return None;
-        }
-        if let Some(method_name) = method_name_from_segment(segment) {
-            current_type = typed_method_return_type(&current_type, &method_name)?;
-            continue;
-        }
-
-        if segment.ends_with(']') {
-            current_type = indexed_value_type(&current_type);
-            continue;
-        }
-
-        return None;
-    }
-
-    Some(current_type)
-}
-
-fn split_member_chain(expr: &str) -> Vec<String> {
-    let bytes = expr.as_bytes();
-    let mut idx = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    let mut brace = 0usize;
-    let mut start = 0usize;
-    let mut out = Vec::new();
-
-    while idx < bytes.len() {
-        let ch = bytes[idx];
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-                idx += 1;
-                continue;
-            }
-            if ch == b'\\' {
-                escaped = true;
-                idx += 1;
-                continue;
-            }
-            if ch == q {
-                quote = None;
-            }
-            idx += 1;
-            continue;
-        }
-
-        if ch == b'\'' || ch == b'"' {
-            quote = Some(ch);
-            idx += 1;
-            continue;
-        }
-
-        match ch {
-            b'(' => paren += 1,
-            b')' => paren = paren.saturating_sub(1),
-            b'[' => bracket += 1,
-            b']' => bracket = bracket.saturating_sub(1),
-            b'{' => brace += 1,
-            b'}' => brace = brace.saturating_sub(1),
-            b'.' if paren == 0 && bracket == 0 && brace == 0 => {
-                let part = expr[start..idx].trim();
-                if !part.is_empty() {
-                    out.push(part.to_string());
-                }
-                start = idx + 1;
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    let tail = expr[start..].trim();
-    if !tail.is_empty() {
-        out.push(tail.to_string());
-    }
-
-    out
-}
-
-fn base_segment_type(script: &ParsedScript, segment: &str, line: usize) -> Option<String> {
-    let segment = segment.trim();
-    if segment.is_empty() {
-        return None;
-    }
-
-    if let Some(type_name) = constructor_type_from_expression(segment) {
-        return Some(type_name);
-    }
-
-    if let Some(index_base) = strip_index_suffix(segment) {
-        return base_segment_type(script, index_base, line).map(|ty| indexed_value_type(&ty));
-    }
-
-    if let Some(call_name) = method_name_from_segment(segment) {
-        if is_type_name(&call_name) {
-            return Some(call_name);
-        }
-
-        if let Some(func_decl) = best_matching_decl(script, &call_name, line)
-            && matches!(func_decl.kind, ScriptDeclKind::Function)
-        {
-            let signature = function_signature(script, func_decl.line).unwrap_or_default();
-            if let Some(return_type) = function_return_type(&signature) {
-                return Some(return_type);
-            }
-        }
-
-        return None;
-    }
-
-    symbol_type_at(script, segment, line)
-}
-
-fn constructor_type_from_expression(expr: &str) -> Option<String> {
-    let expr = expr.trim();
-    let open = expr.find(".new(")?;
-    let type_name = expr[..open].trim();
-    if is_type_name(type_name) {
-        Some(type_name.to_string())
-    } else {
-        None
-    }
-}
-
-fn strip_index_suffix(segment: &str) -> Option<&str> {
-    if !segment.ends_with(']') {
-        return None;
-    }
-
-    let bytes = segment.as_bytes();
-    let mut idx = bytes.len();
-    let mut depth = 0isize;
-    while idx > 0 {
-        idx -= 1;
-        match bytes[idx] {
-            b']' => depth += 1,
-            b'[' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(segment[..idx].trim());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn indexed_value_type(container_type: &str) -> String {
-    match container_type {
-        "String" => "String".to_string(),
-        "PackedByteArray" | "PackedInt32Array" | "PackedInt64Array" => "int".to_string(),
-        "PackedStringArray" => "String".to_string(),
-        "Array" | "Dictionary" => "Variant".to_string(),
-        _ => "Variant".to_string(),
-    }
-}
-
-fn method_name_from_segment(segment: &str) -> Option<String> {
-    let segment = segment.trim();
-    let open = segment.find('(')?;
-    let name = segment[..open].trim();
-    extract_identifier(name).filter(|ident| ident == name)
-}
-
-fn symbol_type_at(script: &ParsedScript, symbol: &str, line: usize) -> Option<String> {
-    if symbol == "self" {
-        if let Some(base) = explicit_extends_in_file(script) {
-            return Some(base);
-        }
-    }
-
-    if is_type_name(symbol) {
-        return Some(symbol.to_string());
-    }
-
-    if let Some(assignment_type) = assignment_type_at(script, symbol, line) {
-        return Some(assignment_type);
-    }
-
-    if let Some(param_type) = parameter_type_at(script, symbol, line) {
-        return Some(param_type);
-    }
-
-    if let Some(decl) = best_matching_decl(script, symbol, line)
-        && let Some(decl_type) = declaration_value_type(decl)
-    {
-        return Some(decl_type);
-    }
-
-    if let Some(inline_decl) = best_inline_binding_decl(script, symbol, line)
-        && let Some(decl_type) = declaration_value_type(&inline_decl)
-    {
-        return Some(decl_type);
-    }
-
-    None
-}
-
-fn assignment_type_at(script: &ParsedScript, symbol: &str, line: usize) -> Option<String> {
-    let target_scope = containing_function_line(script, line);
-    let target_indent = script
-        .lines
-        .get(line.saturating_sub(1))
-        .map(|value| line_indent(value))
-        .unwrap_or(0);
-    let mut best: Option<(usize, String)> = None;
-
-    for (idx, raw_line) in script.lines.iter().enumerate().take(line) {
-        let line_num = idx + 1;
-        let assign_scope = containing_function_line(script, line_num);
-        if assign_scope != target_scope {
-            continue;
-        }
-
-        let Some((lhs, rhs)) = parse_simple_assignment(raw_line) else {
-            continue;
-        };
-        if lhs != symbol {
-            continue;
-        }
-
-        let assign_indent = line_indent(raw_line);
-        if line_num < line && assign_indent > target_indent {
-            continue;
-        }
-
-        let ty = resolve_type_from_expression(script, rhs, line_num)
-            .or_else(|| infer_type_from_expression(rhs));
-        let Some(ty) = ty else {
-            continue;
-        };
-
-        if best
-            .as_ref()
-            .is_none_or(|(best_line, _)| line_num > *best_line)
-        {
-            best = Some((line_num, ty));
-        }
-    }
-
-    best.map(|(_, ty)| ty)
-}
-
-fn parse_simple_assignment(line_text: &str) -> Option<(String, &str)> {
-    let code = parse_code_prefix(line_text).trim();
-    if code.is_empty()
-        || code.starts_with("var ")
-        || code.starts_with("const ")
-        || code.starts_with("func ")
-    {
-        return None;
-    }
-
-    if let Some((lhs, rhs)) = code.split_once(":=") {
-        let lhs = lhs.trim();
-        let symbol = extract_identifier(lhs)?;
-        if symbol != lhs {
-            return None;
-        }
-        return Some((symbol, rhs.trim()));
-    }
-
-    let (lhs, rhs) = code.split_once('=')?;
-    let lhs = lhs.trim();
-    let rhs = rhs.trim();
-    if lhs.ends_with('!')
-        || lhs.ends_with('<')
-        || lhs.ends_with('>')
-        || lhs.ends_with('=')
-        || lhs.ends_with('+')
-        || lhs.ends_with('-')
-        || lhs.ends_with('*')
-        || lhs.ends_with('/')
-        || lhs.ends_with('%')
-        || rhs.starts_with('=')
-    {
-        return None;
-    }
-    let symbol = extract_identifier(lhs)?;
-    if symbol != lhs {
-        return None;
-    }
-
-    Some((symbol, rhs))
-}
-
-fn parameter_type_at(script: &ParsedScript, symbol: &str, line: usize) -> Option<String> {
-    let function_line = containing_function_line(script, line)?;
-    let signature = function_signature(script, function_line)?;
-    let params = parse_function_parameters(&signature);
-    let param = params.into_iter().find(|param| param.name == symbol)?;
-    Some(
-        param
-            .param_type
-            .or_else(|| {
-                param
-                    .default_value
-                    .as_deref()
-                    .and_then(infer_type_from_expression)
-            })
-            .unwrap_or_else(|| "Variant".to_string()),
-    )
-}
-
-fn declaration_value_type(decl: &ScriptDecl) -> Option<String> {
-    match decl.kind {
-        ScriptDeclKind::Variable | ScriptDeclKind::Constant => {
-            let (_, code, _) = split_code_and_comment(&decl.text);
-            parse_binding_type_and_value(&code).0
-        }
-        ScriptDeclKind::Class => Some(decl.name.clone()),
-        ScriptDeclKind::Function => None,
-    }
-}
-
-fn typed_method_return_type(receiver_type: &str, method_name: &str) -> Option<String> {
-    let method = method_candidates_for_receiver(Some(receiver_type), method_name)
-        .into_iter()
-        .next()?;
-    let (_, tail) = method.signature.rsplit_once("->")?;
-    let ty = tail.trim();
-    if ty.is_empty() {
-        None
-    } else {
-        Some(ty.to_string())
-    }
-}
-
 fn method_candidates_for_receiver(
     receiver_type: Option<&str>,
     method_name: &str,
 ) -> Vec<NodeMethodDoc> {
-    let mut methods = node_method_hover_metadata()
-        .get(method_name)
-        .cloned()
-        .unwrap_or_default();
-    if methods.is_empty() {
-        return methods;
-    }
-
-    if let Some(receiver_type) = receiver_type {
-        let ancestry = type_ancestry(receiver_type);
-        let rank = ancestry
-            .iter()
-            .enumerate()
-            .map(|(idx, ty)| (ty.clone(), idx))
-            .collect::<HashMap<_, _>>();
-
-        methods.retain(|method| rank.contains_key(&method.class_name));
-        methods.sort_by(|a, b| {
-            let rank_a = rank.get(&a.class_name).copied().unwrap_or(usize::MAX);
-            let rank_b = rank.get(&b.class_name).copied().unwrap_or(usize::MAX);
-            rank_a
-                .cmp(&rank_b)
-                .then(a.class_name.cmp(&b.class_name))
-                .then(a.signature.cmp(&b.signature))
-        });
-        methods.dedup_by(|a, b| a.class_name == b.class_name && a.signature == b.signature);
-        return methods;
-    }
-
-    methods.sort_by(|a, b| {
-        a.class_name
-            .cmp(&b.class_name)
-            .then(a.signature.cmp(&b.signature))
-    });
-    methods.dedup_by(|a, b| a.class_name == b.class_name && a.signature == b.signature);
-    methods
+    crate::type_system::method_candidates_for_receiver(receiver_type, method_name)
+        .into_iter()
+        .map(|method| NodeMethodDoc {
+            name: method.name,
+            class_name: method.class_name,
+            signature: method.signature,
+            hover: method.hover,
+        })
+        .collect()
 }
 
 fn method_candidates_for_hover(
@@ -1878,11 +1499,11 @@ pub fn known_signatures_for_symbol(
         return Vec::new();
     }
 
-    if let Some((signature, body)) = builtin_hover_metadata().get(name) {
+    if let Some((signature, body)) = crate::type_system::builtin_signature(name) {
         return vec![KnownSignature {
             label: signature.clone(),
-            parameters: signature_parameter_labels(signature),
-            documentation: body.clone(),
+            parameters: signature_parameter_labels(&signature),
+            documentation: body,
         }];
     }
 
@@ -2173,6 +1794,14 @@ fn class_method_doc_uri(class_name: &str, method_name: &str) -> String {
     )
 }
 
+fn class_property_doc_uri(class_name: &str, property_name: &str) -> String {
+    let class = class_name.to_ascii_lowercase();
+    let property = property_name.to_ascii_lowercase().replace('_', "-");
+    format!(
+        "https://docs.godotengine.org/en/stable/classes/class_{class}.html#class-{class}-property-{property}"
+    )
+}
+
 fn known_type_doc_uri(name: &str) -> Option<String> {
     if !is_type_name(name) {
         return None;
@@ -2407,30 +2036,6 @@ fn extract_identifier(input: &str) -> Option<String> {
     }
 
     Some(token)
-}
-
-fn builtin_hover_metadata() -> &'static HashMap<String, (String, String)> {
-    static BUILTIN_META: OnceLock<HashMap<String, (String, String)>> = OnceLock::new();
-    BUILTIN_META.get_or_init(|| {
-        let source = include_str!("../data/godot_4_6_builtin_meta.tsv");
-        validate_metadata_headers("godot_4_6_builtin_meta.tsv", source, builtin_meta_header())
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        source
-            .lines()
-            .skip(1)
-            .filter_map(|line| {
-                let mut fields = line.splitn(3, '\t');
-                let name = fields.next()?.trim();
-                let signature = fields.next()?.trim();
-                let hover = fields.next()?.trim();
-                if name.is_empty() || signature.is_empty() || hover.is_empty() {
-                    return None;
-                }
-                Some((name.to_string(), (signature.to_string(), hover.to_string())))
-            })
-            .collect()
-    })
 }
 
 fn node_method_hover_metadata() -> &'static HashMap<String, Vec<NodeMethodDoc>> {
@@ -2697,6 +2302,60 @@ mod tests {
                 .title
                 .contains("RandomNumberGenerator method randomize() -> void"),
             "hover: {hover:#?}"
+        );
+    }
+
+    #[test]
+    fn typed_receiver_property_hover_resolves_property_type_and_docs() {
+        let source = "func _ready() -> void:\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\n    _player.stream.get_length()\n";
+        let parsed = parse_script(source, "hover_typed_receiver_property.gd");
+        let hover = hover_at(3, 14, &parsed).expect("hover response");
+
+        assert!(
+            hover
+                .title
+                .contains("AudioStreamPlayer property stream: AudioStream"),
+            "hover: {hover:#?}"
+        );
+        assert!(
+            hover.body.contains("Type: `AudioStream`"),
+            "hover: {hover:#?}"
+        );
+    }
+
+    #[test]
+    fn chained_property_receiver_method_hover_uses_property_type() {
+        let source = "func _ready() -> void:\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\n    _player.stream.get_length()\n";
+        let parsed = parse_script(source, "hover_property_receiver_method.gd");
+        let hover = hover_at(3, 21, &parsed).expect("hover response");
+
+        assert!(
+            hover
+                .title
+                .contains("AudioStream method get_length() -> float"),
+            "hover: {hover:#?}"
+        );
+        assert!(
+            !hover.title.contains("ambiguous method"),
+            "hover should not be ambiguous: {hover:#?}"
+        );
+    }
+
+    #[test]
+    fn property_hover_inside_call_argument_keeps_member_target() {
+        let source = "func _ready() -> void:\n    var _impact_sfx: AudioStreamPlayer = AudioStreamPlayer.new()\n    var max_offset := maxf(_impact_sfx.stream.get_length() - 0.001, 0.0)\n";
+        let parsed = parse_script(source, "hover_property_call_argument.gd");
+        let hover = hover_at(3, 40, &parsed).expect("hover response");
+
+        assert!(
+            hover
+                .title
+                .contains("AudioStreamPlayer property stream: AudioStream"),
+            "hover: {hover:#?}"
+        );
+        assert!(
+            !hover.title.contains("max_offset"),
+            "hover should not backtrack to assignment target: {hover:#?}"
         );
     }
 

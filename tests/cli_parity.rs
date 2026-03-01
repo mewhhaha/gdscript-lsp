@@ -22,7 +22,7 @@ fn lint_tabs_fixture_reports_problem() {
 }
 
 #[test]
-fn lint_max_line_length_fixture_reports_problem() {
+fn lint_max_line_length_fixture_is_off_by_default() {
     run_fixture_case("lint", "max-line-length");
 }
 

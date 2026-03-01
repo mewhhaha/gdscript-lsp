@@ -114,13 +114,11 @@ pub fn code_actions_for_diagnostics_and_mode(
                 if !action_available_in_mode(CodeActionKindId::MaxLineLength, mode) {
                     return None;
                 }
-                let replacement: String = source
+                let current = source
                     .lines()
                     .nth(diagnostic.line.saturating_sub(1))
-                    .unwrap_or_default()
-                    .chars()
-                    .take(120)
-                    .collect();
+                    .unwrap_or_default();
+                let replacement = formatter::format_gdscript(current);
 
                 Some(CodeAction {
                     title: "Wrap long line".to_string(),

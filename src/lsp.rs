@@ -21,6 +21,7 @@ use crate::lint::{
 use crate::parser::{ParsedScript, ScriptDeclKind, parse_script};
 use crate::project_godot::load_project_godot_config;
 use crate::semantic::{SemanticDocument, SymbolLocation, SymbolSpan, WorkspaceSemanticIndex};
+use crate::type_system::infer_expression_type as infer_expression_type_ts;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LspRequest {
@@ -751,7 +752,8 @@ fn handle_request(
                 .and_then(|uri| state.parsed_for_uri(uri).cloned())
                 .unwrap_or_else(|| parse_script(&source, uri.unwrap_or("stdin://lsp.gd")));
 
-            let call_context = call_context_at_position(&source, line, character, uri, state);
+            let call_context =
+                call_context_at_position(&source, line, character, uri, state, &parsed);
             let known = call_context
                 .as_ref()
                 .map(|ctx| {
@@ -1794,6 +1796,7 @@ fn call_context_at_position(
     character: usize,
     uri: Option<&str>,
     state: &LspState,
+    script: &ParsedScript,
 ) -> Option<CallContext> {
     let cursor = source_byte_offset_for_position(source, line, character);
     let prefix = &source[..cursor.min(source.len())];
@@ -1853,8 +1856,10 @@ fn call_context_at_position(
         .find(|frame| frame.callee_expr.is_some())?;
     let callee_expr = frame.callee_expr.as_deref()?.trim();
     let (callee, receiver_expr) = split_callee_expression(callee_expr)?;
-    let receiver_type =
-        receiver_expr.and_then(|expr| infer_expression_type(expr, state, uri, source, line));
+    let receiver_type = receiver_expr.and_then(|expr| {
+        infer_expression_type_ts(script, expr, line)
+            .or_else(|| infer_expression_type(expr, state, uri, source, line))
+    });
 
     Some(CallContext {
         callee,

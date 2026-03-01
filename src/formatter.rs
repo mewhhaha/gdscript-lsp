@@ -206,12 +206,34 @@ fn wrap_long_line_if_needed(indent: &str, content: &str) -> String {
         return single_line;
     }
 
-    wrap_multiline_braced_record(indent, content).unwrap_or(single_line)
+    wrap_multiline_braced_record(indent, content)
+        .or_else(|| wrap_multiline_bracket_list(indent, content))
+        .or_else(|| wrap_multiline_parenthesized_list(indent, content))
+        .unwrap_or(single_line)
 }
 
 fn wrap_multiline_braced_record(indent: &str, content: &str) -> Option<String> {
-    let (open_idx, close_idx) = find_braced_record_bounds(content)?;
-    let prefix = content[..open_idx].trim_end();
+    wrap_multiline_delimited_list(indent, content, b'{', b'}')
+}
+
+fn wrap_multiline_parenthesized_list(indent: &str, content: &str) -> Option<String> {
+    wrap_multiline_delimited_list(indent, content, b'(', b')')
+}
+
+fn wrap_multiline_bracket_list(indent: &str, content: &str) -> Option<String> {
+    wrap_multiline_delimited_list(indent, content, b'[', b']')
+}
+
+fn wrap_multiline_delimited_list(
+    indent: &str,
+    content: &str,
+    open: u8,
+    close: u8,
+) -> Option<String> {
+    let (open_idx, close_idx) = find_delimited_bounds(content, open, close)?;
+    let prefix_raw = &content[..open_idx];
+    let prefix = prefix_raw.trim_end();
+    let had_space_before_open = prefix_raw.len() > prefix.len();
     let suffix = content[close_idx + 1..].trim();
     let inner = &content[open_idx + 1..close_idx];
     let fields = split_top_level_segments(inner)?;
@@ -222,10 +244,10 @@ fn wrap_multiline_braced_record(indent: &str, content: &str) -> Option<String> {
     let mut out = String::new();
     out.push_str(indent);
     out.push_str(prefix);
-    if needs_space_before_open_brace(prefix) {
+    if had_space_before_open || needs_space_before_open_delimiter(prefix, open) {
         out.push(' ');
     }
-    out.push('{');
+    out.push(open as char);
     out.push('\n');
 
     let child_indent = format!("{indent}    ");
@@ -239,17 +261,18 @@ fn wrap_multiline_braced_record(indent: &str, content: &str) -> Option<String> {
     }
 
     out.push_str(indent);
-    out.push('}');
+    out.push(close as char);
     if !suffix.is_empty() {
         if needs_space_before_suffix(suffix) {
             out.push(' ');
         }
         out.push_str(suffix);
     }
+
     Some(out)
 }
 
-fn find_braced_record_bounds(content: &str) -> Option<(usize, usize)> {
+fn find_delimited_bounds(content: &str, open: u8, close: u8) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut idx = 0usize;
     let mut quote = None::<u8>;
@@ -297,7 +320,7 @@ fn find_braced_record_bounds(content: &str) -> Option<(usize, usize)> {
             return None;
         }
 
-        if ch == b'{' {
+        if ch == open {
             if open_idx.is_none() {
                 open_idx = Some(idx);
             }
@@ -306,7 +329,7 @@ fn find_braced_record_bounds(content: &str) -> Option<(usize, usize)> {
             continue;
         }
 
-        if ch == b'}' && depth > 0 {
+        if ch == close && depth > 0 {
             depth -= 1;
             if depth == 0 {
                 return open_idx.map(|open| (open, idx));
@@ -399,7 +422,11 @@ fn split_top_level_segments(inner: &str) -> Option<Vec<String>> {
     }
 }
 
-fn needs_space_before_open_brace(prefix: &str) -> bool {
+fn needs_space_before_open_delimiter(prefix: &str, open: u8) -> bool {
+    if open != b'{' {
+        return false;
+    }
+
     let Some(last) = prefix.as_bytes().last().copied() else {
         return false;
     };
@@ -595,6 +622,27 @@ mod tests {
     fn wraps_long_dictionary_record_lines() {
         let source = "func config() -> Dictionary:\n    var cfg = {\"gravity\": 9.8, \"jump_speed\": 14.0, \"air_control\": 0.35, \"camera_sensitivity\": 0.12, \"max_speed\": 35.0}\n";
         let expected = "func config() -> Dictionary:\n    var cfg = {\n        \"gravity\": 9.8,\n        \"jump_speed\": 14.0,\n        \"air_control\": 0.35,\n        \"camera_sensitivity\": 0.12,\n        \"max_speed\": 35.0\n    }\n";
+        assert_eq!(format_gdscript(source), expected);
+    }
+
+    #[test]
+    fn wraps_long_call_argument_lists() {
+        let source = "func demo() -> void:\n    configure_player_state(\"run_fast\", 14.0, 0.35, 0.12, true, \"forward\", \"sprint\", 0.5, \"long_animation_name\", \"turn_accel_high\")\n";
+        let expected = "func demo() -> void:\n    configure_player_state(\n        \"run_fast\",\n        14.0,\n        0.35,\n        0.12,\n        true,\n        \"forward\",\n        \"sprint\",\n        0.5,\n        \"long_animation_name\",\n        \"turn_accel_high\"\n    )\n";
+        assert_eq!(format_gdscript(source), expected);
+    }
+
+    #[test]
+    fn wraps_long_array_literals() {
+        let source = "func points() -> Array:\n    var values = [Vector2(0.0, 0.0), Vector2(1.0, 1.0), Vector2(2.0, 2.0), Vector2(3.0, 3.0), Vector2(4.0, 4.0)]\n";
+        let expected = "func points() -> Array:\n    var values = [\n        Vector2(0.0, 0.0),\n        Vector2(1.0, 1.0),\n        Vector2(2.0, 2.0),\n        Vector2(3.0, 3.0),\n        Vector2(4.0, 4.0)\n    ]\n";
+        assert_eq!(format_gdscript(source), expected);
+    }
+
+    #[test]
+    fn wraps_long_constructor_call_with_named_identifiers() {
+        let source = "func _ready() -> void:\n    var random_pitch_offset := _rng.randf_range(-impact_pitch_randomness_super_long_name, impact_pitch_randomness_super_long_name)\n";
+        let expected = "func _ready() -> void:\n    var random_pitch_offset := _rng.randf_range(\n        -impact_pitch_randomness_super_long_name,\n        impact_pitch_randomness_super_long_name\n    )\n";
         assert_eq!(format_gdscript(source), expected);
     }
 }
