@@ -378,8 +378,10 @@ fn hover_on_value_includes_type_value_and_comments() {
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"# health points\\nvar health: int = 100 # initial hp\\nfunc _ready():\\n    print(health)\\n\",\"line\":4,\"character\":11}}\n{\"method\":\"exit\"}\n",
     );
 
-    assert!(output.contains("Type: `int`"), "output: {output}");
-    assert!(output.contains("Value: `100`"), "output: {output}");
+    assert!(
+        output.contains("```gdscript\\nvar health: int = 100\\n```"),
+        "output: {output}"
+    );
     assert!(output.contains("health points"), "output: {output}");
     assert!(output.contains("initial hp"), "output: {output}");
 }
@@ -403,6 +405,63 @@ fn hover_on_literal_includes_literal_type() {
 
     assert!(output.contains("Type: `int`"), "output: {output}");
     assert!(output.contains("Value: `42`"), "output: {output}");
+}
+
+#[test]
+fn hover_on_typed_receiver_method_uses_docs_metadata() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    var _rng: RandomNumberGenerator = RandomNumberGenerator.new()\\n    _rng.randomize()\\n\",\"line\":3,\"character\":12}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("RandomNumberGenerator method randomize() -> void"),
+        "output: {output}"
+    );
+    assert!(output.contains("time-based seed"), "output: {output}");
+}
+
+#[test]
+fn hover_on_typed_receiver_method_uses_inherited_docs_metadata() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"var node_ref: Node3D\\nfunc _ready():\\n    node_ref.queue_free()\\n\",\"line\":3,\"character\":15}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("Node method queue_free() -> void"),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("Queues this node to be deleted"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_chained_typed_receiver_method_uses_docs_metadata() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _make_rng() -> RandomNumberGenerator:\\n    return RandomNumberGenerator.new()\\n\\nfunc _ready():\\n    _make_rng().randomize()\\n\",\"line\":5,\"character\":19}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("RandomNumberGenerator method randomize() -> void"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_ambiguous_method_reports_candidates() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    clear()\\n\",\"line\":2,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("ambiguous method `clear`"),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("Multiple Godot methods match"),
+        "output: {output}"
+    );
 }
 
 #[test]
@@ -432,13 +491,13 @@ fn hover_handles_shadowing_nested_scope_and_multiline_function_sections() {
     assert!(
         inner["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("Value: `99`")),
+            .is_some_and(|value| value.contains("var score: int = 99")),
         "inner scope hover should resolve nested shadowed variable: {inner:#?}"
     );
     assert!(
         outer["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("Value: `10`")),
+            .is_some_and(|value| value.contains("var score: int = 10")),
         "outer scope hover should resolve function-level variable: {outer:#?}"
     );
     let function_contents = function_hover["result"]["contents"]["value"]
@@ -485,6 +544,64 @@ fn hover_type_sections_include_inheritance_and_enum_members() {
             .as_str()
             .is_some_and(|value| value.contains("Members: IDLE, RUNNING, JUMPING")),
         "enum hover should include enum member list: {enum_hover:#?}"
+    );
+}
+
+#[test]
+fn docs_parity_fixture_covers_typed_hover_and_ambiguous_fallbacks() {
+    let source = fixture_text("lsp", "docs-parity", "input.gd");
+    let uri = "file:///tmp/fixtures/gdscript-lsp-docs-parity.gd";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(uri, &source));
+    requests.push('\n');
+    requests.push_str(&format!(
+        "{{\"id\":2,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":9,\"character\":11}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":3,\"method\":\"textDocument/definition\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":11,\"character\":7}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":14,\"character\":7}}}}}}\n"
+    ));
+    requests.push_str(&format!(
+        "{{\"id\":5,\"method\":\"textDocument/definition\",\"params\":{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":14,\"character\":7}}}}}}\n"
+    ));
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let typed_hover = response_by_id(&responses, 2).expect("typed hover response");
+    let queue_free_def = response_by_id(&responses, 3).expect("queue_free definition response");
+    let ambiguous_hover = response_by_id(&responses, 4).expect("ambiguous hover response");
+    let ambiguous_def = response_by_id(&responses, 5).expect("ambiguous definition response");
+
+    assert!(
+        typed_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("RandomNumberGenerator method randomize() -> void")),
+        "typed hover should match RandomNumberGenerator docs: {typed_hover:#?}"
+    );
+    assert!(
+        queue_free_def["result"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.contains("class_node.html#class-node-method-queue-free"))
+            })),
+        "definition should resolve inherited Node method docs: {queue_free_def:#?}"
+    );
+    assert!(
+        ambiguous_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("ambiguous method `clear`")),
+        "ambiguous hover should describe unresolved overloads: {ambiguous_hover:#?}"
+    );
+    assert!(
+        ambiguous_def["result"]
+            .as_array()
+            .is_some_and(|entries| entries.len() > 1),
+        "ambiguous definition should return deterministic multi-doc candidates: {ambiguous_def:#?}"
     );
 }
 
@@ -608,6 +725,56 @@ fn code_action_includes_declaration_context_action() {
         declaration_context["data"]["symbol"].as_str(),
         Some("define_value"),
         "declaration action should include symbol payload: {declaration_context:#?}"
+    );
+}
+
+#[test]
+fn code_action_includes_new_lint_fixes() {
+    let source = "\
+@export @onready var value = 1\n\
+var player = get_node(\"%Player\")\n\
+1 + 2\n\
+";
+    let request = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "textDocument/codeAction",
+        "params": {
+            "text": source
+        }
+    }))
+    .expect("codeAction request");
+    let responses = run_lsp_responses(&format!("{request}\n{{\"method\":\"exit\"}}\n"));
+    let code_action = response_by_id(&responses, 1).expect("codeAction response");
+    let actions = code_action["result"].as_array().expect("actions");
+
+    let remove_onready = actions
+        .iter()
+        .find(|action| action["title"] == "Remove @onready to keep export precedence")
+        .expect("remove onready action");
+    assert_eq!(
+        remove_onready["edit"]["changes"]["stdin://lsp.gd"][0]["newText"].as_str(),
+        Some("@export var value = 1"),
+        "onready-with-export action should rewrite decorator order: {remove_onready:#?}"
+    );
+
+    let add_onready = actions
+        .iter()
+        .find(|action| action["title"] == "Add @onready annotation")
+        .expect("add onready action");
+    assert_eq!(
+        add_onready["edit"]["changes"]["stdin://lsp.gd"][0]["newText"].as_str(),
+        Some("@onready var player = get_node(\"%Player\")"),
+        "get-node-default action should add annotation: {add_onready:#?}"
+    );
+
+    let consume_expression = actions
+        .iter()
+        .find(|action| action["title"] == "Consume standalone expression with discard")
+        .expect("consume standalone expression action");
+    assert_eq!(
+        consume_expression["edit"]["changes"]["stdin://lsp.gd"][0]["newText"].as_str(),
+        Some("_ = 1 + 2"),
+        "standalone-expression action should insert discard assignment: {consume_expression:#?}"
     );
 }
 
@@ -933,6 +1100,20 @@ fn lsp_definition_falls_back_to_docs_for_builtin_and_node_methods() {
             .as_str()
             .is_some_and(|uri| uri.contains("class_node")),
         "node definition should point to Node docs: {node:#?}"
+    );
+}
+
+#[test]
+fn lsp_definition_returns_multiple_docs_for_ambiguous_method_without_receiver() {
+    let responses = run_lsp_responses(
+        "{\"id\":1,\"method\":\"textDocument/definition\",\"params\":{\"text\":\"func _ready():\\n    clear()\\n\",\"line\":2,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+    let definition = response_by_id(&responses, 1).expect("definition response");
+    let locations = definition["result"].as_array().expect("locations");
+
+    assert!(
+        locations.len() > 1,
+        "ambiguous method should provide multiple deterministic docs candidates: {definition:#?}"
     );
 }
 
@@ -1280,5 +1461,251 @@ fn completion_includes_user_symbols_in_framed_mode() {
     assert!(
         labels.contains("calculate_total"),
         "completion should include user declaration labels: {completion:#?}"
+    );
+}
+
+#[test]
+fn completion_includes_godot4_keywords() {
+    let source = "func _ready() -> void:\n    wh\n";
+    let uri = "file:///tmp/fixtures/gdscript-lsp-keyword-completion.gd";
+
+    let mut requests = String::new();
+    requests.push_str(&frame_message(r#"{"id":1,"method":"initialize"}"#));
+    requests.push_str(&frame_message(&did_open_message(uri, source)));
+    requests.push_str(&frame_message(
+        r#"{"id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/fixtures/gdscript-lsp-keyword-completion.gd"},"position":{"line":1,"character":6}}}"#,
+    ));
+    requests.push_str(&frame_message(r#"{"method":"exit"}"#));
+
+    let responses = parse_framed_output(&run_lsp(&requests));
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let labels: HashSet<String> = completion["result"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect();
+
+    assert!(
+        labels.contains("while"),
+        "completion should include while keyword: {completion:#?}"
+    );
+    assert!(
+        labels.contains("when"),
+        "completion should include when keyword: {completion:#?}"
+    );
+}
+
+#[test]
+fn completion_on_typed_receiver_includes_method_docs_entries() {
+    let source = "func _ready():\n    var _rng: RandomNumberGenerator = RandomNumberGenerator.new()\n    _rng.ra\n";
+    let uri = "file:///tmp/fixtures/gdscript-lsp-method-completion.gd";
+
+    let mut requests = String::new();
+    requests.push_str(&frame_message(r#"{"id":1,"method":"initialize"}"#));
+    requests.push_str(&frame_message(&did_open_message(uri, source)));
+    requests.push_str(&frame_message(
+        r#"{"id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/fixtures/gdscript-lsp-method-completion.gd"},"position":{"line":2,"character":11}}}"#,
+    ));
+    requests.push_str(&frame_message(r#"{"method":"exit"}"#));
+
+    let responses = parse_framed_output(&run_lsp(&requests));
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let items = completion["result"]["items"]
+        .as_array()
+        .expect("completion items");
+
+    assert!(
+        items.iter().any(|item| item["label"] == "randomize"
+            && item["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("RandomNumberGenerator"))),
+        "typed receiver completion should include randomize docs entry: {completion:#?}"
+    );
+}
+
+#[test]
+fn completion_on_typed_receiver_uses_snippet_insert_for_method_args() {
+    let source = "func _ready():\n    var _rng: RandomNumberGenerator = RandomNumberGenerator.new()\n    _rng.randi_\n";
+    let uri = "file:///tmp/fixtures/gdscript-lsp-method-snippet-completion.gd";
+
+    let mut requests = String::new();
+    requests.push_str(&frame_message(r#"{"id":1,"method":"initialize"}"#));
+    requests.push_str(&frame_message(&did_open_message(uri, source)));
+    requests.push_str(&frame_message(
+        r#"{"id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/fixtures/gdscript-lsp-method-snippet-completion.gd"},"position":{"line":2,"character":14}}}"#,
+    ));
+    requests.push_str(&frame_message(r#"{"method":"exit"}"#));
+
+    let responses = parse_framed_output(&run_lsp(&requests));
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let item = completion["result"]["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|entry| entry["label"] == "randi_range")
+        .cloned()
+        .expect("randi_range completion");
+
+    assert_eq!(
+        item["insertTextFormat"].as_u64(),
+        Some(2),
+        "method completion should return snippet insert format: {item:#?}"
+    );
+    assert!(
+        item["insertText"]
+            .as_str()
+            .is_some_and(|insert| insert.contains("${1:") && insert.contains("${2:")),
+        "method completion should include parameter placeholders: {item:#?}"
+    );
+}
+
+#[test]
+fn signature_help_on_typed_receiver_uses_docs_and_active_parameter() {
+    let source = "func _ready():\n    var rng: RandomNumberGenerator = RandomNumberGenerator.new()\n    rng.randi_range(1, 2)\n";
+    let uri = "file:///tmp/fixtures/gdscript-lsp-signaturehelp-typed.gd";
+
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(uri, source));
+    requests.push('\n');
+    requests.push_str("{\"id\":2,\"method\":\"textDocument/signatureHelp\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/fixtures/gdscript-lsp-signaturehelp-typed.gd\"},\"position\":{\"line\":3,\"character\":23}}}\n");
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let signature_help = response_by_id(&responses, 2).expect("signatureHelp response");
+    let signatures = signature_help["result"]["signatures"]
+        .as_array()
+        .expect("signatures");
+
+    assert!(
+        signatures.iter().any(|signature| {
+            signature["label"]
+                .as_str()
+                .is_some_and(|label| label.contains("randi_range("))
+        }),
+        "typed receiver signature help should use docs metadata signatures: {signature_help:#?}"
+    );
+    assert_eq!(
+        signature_help["result"]["activeParameter"].as_u64(),
+        Some(1),
+        "signature help should track active parameter index from call context: {signature_help:#?}"
+    );
+}
+
+#[test]
+fn initialize_completion_includes_project_class_and_autoload_symbols() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gdscript-lsp-project-symbols-{stamp}"));
+    fs::create_dir_all(&root).expect("create workspace root");
+
+    fs::write(
+        root.join("project.godot"),
+        "[autoload]\nGameState=\"*res://autoload/game_state.gd\"\n",
+    )
+    .expect("write project.godot");
+    fs::write(
+        root.join("typed.gd"),
+        "class_name CombatDirector\nextends Node\n",
+    )
+    .expect("write class file");
+    fs::write(
+        root.join("consumer.gd"),
+        "func _ready() -> void:\n    Ga\n    Co\n",
+    )
+    .expect("write consumer file");
+
+    let root_uri = file_uri(&root);
+    let consumer_uri = file_uri(&root.join("consumer.gd"));
+    let init = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root_uri
+        }
+    }))
+    .expect("init request");
+
+    let completion_autoload = serde_json::to_string(&json!({
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": consumer_uri },
+            "position": { "line": 2, "character": 7 }
+        }
+    }))
+    .expect("autoload completion request");
+
+    let completion_class = serde_json::to_string(&json!({
+        "id": 3,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": consumer_uri },
+            "position": { "line": 3, "character": 7 }
+        }
+    }))
+    .expect("class completion request");
+
+    let mut requests = String::new();
+    requests.push_str(&init);
+    requests.push('\n');
+    requests.push_str(&completion_autoload);
+    requests.push('\n');
+    requests.push_str(&completion_class);
+    requests.push('\n');
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let autoload_completion = response_by_id(&responses, 2).expect("autoload completion response");
+    let class_completion = response_by_id(&responses, 3).expect("class completion response");
+    let autoload_labels = autoload_completion["result"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+    let class_labels = class_completion["result"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+
+    assert!(
+        autoload_labels.contains("GameState"),
+        "completion should include autoload symbols from project.godot: {autoload_completion:#?}"
+    );
+    assert!(
+        class_labels.contains("CombatDirector"),
+        "completion should include class_name symbols from workspace: {class_completion:#?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rename_rejects_conflicts_with_builtins() {
+    let uri = "file:///tmp/fixtures/gdscript-lsp-rename-conflict.gd";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests.push_str(&did_open_message(
+        uri,
+        "var value := 1\nfunc test() -> void:\n    value += 1\n",
+    ));
+    requests.push('\n');
+    requests.push_str(
+        "{\"id\":2,\"method\":\"textDocument/rename\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/fixtures/gdscript-lsp-rename-conflict.gd\"},\"position\":{\"line\":3,\"character\":6},\"newName\":\"print\"}}\n",
+    );
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let rename = response_by_id(&responses, 2).expect("rename response");
+    assert_eq!(
+        rename["error"]["code"].as_i64(),
+        Some(-32602),
+        "rename should reject conflicts with builtins: {rename:#?}"
     );
 }

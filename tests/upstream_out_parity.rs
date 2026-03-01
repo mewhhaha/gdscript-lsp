@@ -198,7 +198,7 @@ fn parser_out_fixtures_match_expected_error_messages() {
 fn warning_out_fixtures_match_expected_codes_and_lines() {
     let fixture_dir = warning_fixture_dir();
     let fixtures = fixture_stem_list(&fixture_dir, "out");
-    assert_eq!(fixtures.len(), 46, "expected 46 warning out fixtures");
+    assert_eq!(fixtures.len(), 50, "expected 50 warning out fixtures");
 
     let settings = warning_parity_settings();
     for name in fixtures {

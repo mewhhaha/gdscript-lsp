@@ -1311,11 +1311,7 @@ fn lambda_parameter_diagnostics(
         if trimmed.starts_with("func ") || trimmed.starts_with("static func ") {
             continue;
         }
-        if !trimmed.contains("func(") && !trimmed.contains("func (") {
-            continue;
-        }
-
-        let Some(func_pos) = trimmed.find("func") else {
+        let Some(func_pos) = find_lambda_func_keyword(trimmed) else {
             continue;
         };
         let signature = &trimmed[func_pos..];
@@ -1394,6 +1390,27 @@ fn lambda_parameter_diagnostics(
     diagnostics
 }
 
+fn find_lambda_func_keyword(line: &str) -> Option<usize> {
+    for (idx, _) in line.match_indices("func") {
+        let left = idx
+            .checked_sub(1)
+            .and_then(|position| line.as_bytes().get(position).copied());
+        if left
+            .map(|byte| (byte as char).is_ascii_alphanumeric() || byte == b'_')
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let tail = line[idx + "func".len()..].trim_start();
+        if tail.starts_with('(') {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
 fn missing_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diagnostic> {
     let lines = source.lines().collect::<Vec<_>>();
     let blocks = collect_function_blocks(&lines);
@@ -1452,6 +1469,7 @@ fn missing_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diagno
 fn redundant_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diagnostic> {
     let lines = source.lines().collect::<Vec<_>>();
     let blocks = collect_function_blocks(&lines);
+    let function_return_types = collect_function_return_types(source);
     let signal_names = lines
         .iter()
         .filter_map(|line| {
@@ -1487,6 +1505,7 @@ fn redundant_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diag
         let mut signal_vars = std::collections::HashSet::new();
         let mut callable_targets = std::collections::HashMap::<String, String>::new();
         let mut ignore_next_redundant_await = false;
+        let var_types = collect_local_variable_types(&block);
 
         for line_idx in block.body_start..block.body_end {
             let trimmed = block.lines[line_idx].trim_start();
@@ -1537,6 +1556,12 @@ fn redundant_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diag
             if expr.is_empty() {
                 continue;
             }
+            if expr.ends_with(".call()") || expr.starts_with("call(&\"") {
+                continue;
+            }
+            if var_types.get(expr).is_some_and(|ty| ty == "Variant") || expr.contains('[') {
+                continue;
+            }
 
             let is_signal = signal_names.contains(expr) || signal_vars.contains(expr);
             if is_signal {
@@ -1550,11 +1575,13 @@ fn redundant_await_diagnostics(source: &str, level: DiagnosticLevel) -> Vec<Diag
             if is_coroutine_call && expr.ends_with(')') {
                 continue;
             }
-            if expr.starts_with("call(&\"")
-                && extract_call_name_from_callable_call(expr)
-                    .is_some_and(|target| coroutine_names.contains(target))
-            {
-                continue;
+            if let Some(target) = call_target {
+                if function_return_types
+                    .get(target)
+                    .is_some_and(|return_type| return_type == "Variant")
+                {
+                    continue;
+                }
             }
 
             diagnostics.push(Diagnostic {
@@ -1706,20 +1733,6 @@ fn extract_await_call_target(expression: &str) -> Option<&str> {
     None
 }
 
-fn extract_call_name_from_callable_call(expression: &str) -> Option<&str> {
-    let prefix = "call(&\"";
-    let suffix = "\")";
-    let body = expression.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    if body
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        Some(body)
-    } else {
-        None
-    }
-}
-
 fn standalone_call_name(code: &str) -> Option<&str> {
     let open = code.find('(')?;
     if !code.ends_with(')') {
@@ -1859,6 +1872,26 @@ fn collect_function_first_param_types(source: &str) -> std::collections::HashMap
         .collect()
 }
 
+fn collect_function_return_types(source: &str) -> std::collections::HashMap<String, String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let signature = if let Some(sig) = trimmed.strip_prefix("func ") {
+                sig
+            } else {
+                trimmed.strip_prefix("static func ")?
+            };
+            let name = extract_fn_name(signature)?;
+            let return_type = signature
+                .split_once("->")
+                .map(|(_, ty)| ty.split(':').next().unwrap_or(ty).trim().to_string())
+                .unwrap_or_else(|| "Variant".to_string());
+            Some((name, return_type))
+        })
+        .collect()
+}
+
 fn iter_first_arg_calls<'a>(
     code: &'a str,
     function_param_types: &'a std::collections::HashMap<String, String>,
@@ -1866,9 +1899,8 @@ fn iter_first_arg_calls<'a>(
     let mut out = Vec::new();
 
     for (callee, required) in function_param_types {
-        let needle = format!("{callee}(");
-        if let Some(pos) = code.find(&needle) {
-            if let Some(arg) = extract_first_arg(&code[pos + needle.len()..]) {
+        if let Some(arg_start) = find_callee_arg_start(code, callee) {
+            if let Some(arg) = extract_first_arg(&code[arg_start..]) {
                 out.push((callee.as_str(), required.as_str(), arg));
             }
         }
@@ -1880,9 +1912,8 @@ fn iter_first_arg_calls<'a>(
         ("Vector2", "Vector2"),
         ("int", "int"),
     ] {
-        let needle = format!("{callee}(");
-        if let Some(pos) = code.find(&needle) {
-            if let Some(arg) = extract_first_arg(&code[pos + needle.len()..]) {
+        if let Some(arg_start) = find_callee_arg_start(code, callee) {
+            if let Some(arg) = extract_first_arg(&code[arg_start..]) {
                 out.push((callee, required, arg));
             }
         }
@@ -1891,13 +1922,83 @@ fn iter_first_arg_calls<'a>(
     out
 }
 
+fn find_callee_arg_start(code: &str, callee: &str) -> Option<usize> {
+    for (pos, _) in code.match_indices(callee) {
+        let left = pos
+            .checked_sub(1)
+            .and_then(|index| code.as_bytes().get(index).copied());
+        if left
+            .map(|byte| (byte as char).is_ascii_alphanumeric() || byte == b'_')
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let mut next_index = pos + callee.len();
+        while let Some(next) = code.as_bytes().get(next_index) {
+            if !(*next as char).is_ascii_whitespace() {
+                break;
+            }
+            next_index += 1;
+        }
+
+        if code.as_bytes().get(next_index) == Some(&b'(') {
+            return Some(next_index + 1);
+        }
+    }
+
+    None
+}
+
 fn extract_first_arg(args_and_rest: &str) -> Option<&str> {
-    let end = args_and_rest.find(')')?;
-    let args = &args_and_rest[..end];
-    args.split(',')
-        .next()
-        .map(str::trim)
-        .filter(|arg| !arg.is_empty())
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut in_quote = None::<char>;
+    let mut escaped = false;
+
+    let mut end = None::<usize>;
+    for (idx, ch) in args_and_rest.char_indices() {
+        if let Some(quote) = in_quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == quote {
+                in_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => in_quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => {
+                if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+                    end = Some(idx);
+                    break;
+                }
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                end = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    let arg = args_and_rest[..end].trim();
+    if arg.is_empty() { None } else { Some(arg) }
 }
 
 fn collect_local_variable_types(
@@ -2687,6 +2788,13 @@ fn confusable_local_scope_diagnostics(
                 for scan_idx in block.body_start..declaration.line.saturating_sub(1) {
                     let line = block.lines[scan_idx];
                     let code = line.split('#').next().unwrap_or(line);
+                    let scan_indent = line
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_whitespace())
+                        .count();
+                    if scan_indent > declaration.indent {
+                        continue;
+                    }
                     if line_declares_variable_name(code, &declaration.name) {
                         continue;
                     }
@@ -3431,28 +3539,117 @@ fn has_onready_export_conflict(line: &str) -> bool {
 }
 
 fn contains_confusable_identifier(line: &str) -> bool {
-    let code = line.split('#').next().unwrap_or(line);
-    let mut token = String::new();
+    let code = line.split('#').next().unwrap_or(line).trim();
+    if code.is_empty() {
+        return false;
+    }
 
-    for ch in code.chars().chain(std::iter::once(' ')) {
-        if is_unicode_identifier_char(ch) {
-            token.push(ch);
+    if let Some((_, names)) = parse_local_binding_declaration(code) {
+        if names.into_iter().any(is_confusable_identifier_token) {
+            return true;
+        }
+
+        if let Some((_, rhs)) = code.split_once('=') {
+            return contains_confusable_node_path_identifier(rhs);
+        }
+        return false;
+    }
+
+    if let Some(rest) = code
+        .strip_prefix("var ")
+        .or_else(|| code.strip_prefix("const "))
+    {
+        if let Some(name) = extract_identifier_token(rest) {
+            if is_confusable_identifier_token(&name) {
+                return true;
+            }
+        }
+        if let Some((_, rhs)) = code.split_once('=') {
+            return contains_confusable_node_path_identifier(rhs);
+        }
+        return false;
+    }
+
+    if let Some(rest) = code
+        .strip_prefix("func ")
+        .or_else(|| code.strip_prefix("static func "))
+    {
+        if let Some(name) = extract_fn_name(rest) {
+            return is_confusable_identifier_token(&name);
+        }
+        return false;
+    }
+
+    if let Some(rest) = code.strip_prefix("class_name ") {
+        if let Some(name) = extract_identifier_token(rest) {
+            return is_confusable_identifier_token(&name);
+        }
+        return false;
+    }
+
+    if let Some(rest) = code.strip_prefix("signal ") {
+        if let Some(name) = extract_identifier_token(rest) {
+            return is_confusable_identifier_token(&name);
+        }
+        return false;
+    }
+
+    if let Some(rest) = code.strip_prefix("enum ") {
+        if let Some(name) = extract_identifier_token(rest) {
+            return is_confusable_identifier_token(&name);
+        }
+        return false;
+    }
+
+    contains_confusable_node_path_identifier(code)
+}
+
+fn contains_confusable_node_path_identifier(code: &str) -> bool {
+    let chars = code.char_indices().collect::<Vec<_>>();
+    for (idx, ch) in &chars {
+        if *ch != '$' {
             continue;
         }
 
-        if !token.is_empty() {
-            if token.chars().any(|value| !value.is_ascii())
-                && token
-                    .chars()
-                    .any(|value| value.is_ascii_alphanumeric() || value == '_')
-            {
-                return true;
+        let mut token = String::new();
+        for (_, next) in chars.iter().skip_while(|(pos, _)| *pos <= *idx) {
+            if is_unicode_identifier_char(*next) {
+                token.push(*next);
+                continue;
             }
-            token.clear();
+            if *next == '/' && !token.is_empty() {
+                break;
+            }
+            break;
+        }
+
+        if !token.is_empty() && is_confusable_identifier_token(&token) {
+            return true;
         }
     }
 
     false
+}
+
+fn is_confusable_identifier_token(token: &str) -> bool {
+    token.chars().any(|value| !value.is_ascii())
+        && token
+            .chars()
+            .any(|value| value.is_ascii_alphanumeric() || value == '_')
+}
+
+fn extract_identifier_token(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let mut token = String::new();
+    for ch in trimmed.chars() {
+        if is_unicode_identifier_char(ch) {
+            token.push(ch);
+            continue;
+        }
+        break;
+    }
+
+    if token.is_empty() { None } else { Some(token) }
 }
 
 fn is_unicode_identifier_char(ch: char) -> bool {
@@ -3663,6 +3860,12 @@ fn find_unspaced_assignment_operator(line: &str) -> Option<usize> {
             continue;
         }
 
+        let prev = if idx > 0 { Some(bytes[idx - 1]) } else { None };
+        let next = bytes.get(idx + 1).copied();
+        if prev == Some(b'=') || next == Some(b'=') {
+            continue;
+        }
+
         let mut operator_start = idx;
         while operator_start > 0 && is_assignment_operator_prefix(bytes[operator_start - 1]) {
             operator_start -= 1;
@@ -3859,7 +4062,7 @@ mod tests {
 
     #[test]
     fn comparison_operators_do_not_trigger_assignment_spacing_rule() {
-        let source = "if value<=1:\n    pass\nif value!=2:\n    pass\n";
+        let source = "if value <= 1:\n    pass\nif value == 2:\n    pass\nif value != 3:\n    pass\nif value >= 4:\n    pass\n";
         let diagnostics = check_document_with_settings(source, &LintSettings::default());
         assert!(
             diagnostics
@@ -3867,6 +4070,84 @@ mod tests {
                 .all(|diag| diag.code != "spaces-around-operator"),
             "diagnostics: {diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn confusable_identifier_prefers_declarations_and_node_path_tokens() {
+        let source = "func test():\n\tvar port = 0\n\tvar pοrt = 1\n\tprints(port, pοrt)\n\tvar _node = $pοrt\n";
+        let diagnostics = check_document_with_settings(source, &LintSettings::default());
+        let mut lines = diagnostics
+            .iter()
+            .filter(|diag| diag.code == "confusable-identifier")
+            .map(|diag| diag.line)
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![3, 5], "diagnostics: {diagnostics:#?}");
+    }
+
+    #[test]
+    fn confusable_local_usage_ignores_deeper_nested_scope_reads() {
+        let source =
+            "func test():\n\tif true:\n\t\tvar a = 1\n\t\tprint(a)\n\tvar a = 2\n\tprint(a)\n";
+        let diagnostics = check_document_with_settings(source, &LintSettings::default());
+        let usage_lines = diagnostics
+            .iter()
+            .filter(|diag| diag.code == "confusable-local-usage")
+            .map(|diag| diag.line)
+            .collect::<Vec<_>>();
+        assert!(usage_lines.is_empty(), "diagnostics: {diagnostics:#?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == "confusable-local-declaration"),
+            "diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn lambda_parameter_rule_ignores_function_calls_with_func_in_name() {
+        let source = "func variant_func(x: int) -> void:\n\tprint(x)\n\nfunc test() -> void:\n\tvariant_func(1)\n";
+        let diagnostics = check_document_with_settings(source, &LintSettings::default());
+        assert!(
+            diagnostics.iter().all(|diag| {
+                !(diag.code == "unused-parameter" && diag.message.contains("<anonymous lambda>()"))
+            }),
+            "diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_call_argument_rule_does_not_match_callee_substrings() {
+        let source = "func test() -> void:\n\tvar value: Variant = 1\n\tprint(value)\n";
+        let mut settings = LintSettings::default();
+        settings.rule_severities.insert(
+            "unsafe-call-argument".to_string(),
+            super::DiagnosticLevel::Warning,
+        );
+        let diagnostics = check_document_with_settings(&source, &settings);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != "unsafe-call-argument"),
+            "diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_call_argument_rule_handles_nested_constructor_calls() {
+        let source = "func node_func(x: Node) -> void:\n\tprint(x)\n\nfunc test() -> void:\n\tvar variant: Variant = null\n\tnode_func(variant)\n\tnode_func(Object.new())\n\tnode_func(Node.new())\n\tnode_func(Node2D.new())\n";
+        let mut settings = LintSettings::default();
+        settings.rule_severities.insert(
+            "unsafe-call-argument".to_string(),
+            super::DiagnosticLevel::Warning,
+        );
+        let diagnostics = check_document_with_settings(&source, &settings);
+        let lines = diagnostics
+            .iter()
+            .filter(|diag| diag.code == "unsafe-call-argument")
+            .map(|diag| diag.line)
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![6, 7], "diagnostics: {diagnostics:#?}");
     }
 
     #[test]

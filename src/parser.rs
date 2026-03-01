@@ -1,6 +1,8 @@
+use crate::docs_meta::{class_meta_header, validate_metadata_headers};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptDecl {
@@ -350,6 +352,16 @@ fn parse_variable_declaration(
                 break;
             }
         } else if !seen_any {
+            let raw_token = rest
+                .split(|ch: char| {
+                    ch.is_ascii_whitespace() || matches!(ch, ':' | '=' | ',' | '(' | ')')
+                })
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !raw_token.is_empty() && raw_token.chars().any(|ch| !ch.is_ascii()) {
+                break;
+            }
             issues.push(ParserError {
                 message: format!(
                     "Expected {} name after \"{}\".",
@@ -372,7 +384,11 @@ fn parse_variable_declaration(
             if rest.starts_with('=') {
                 let rhs = rest.trim_start_matches('=').trim_start();
                 let is_dictionary_literal = rhs.starts_with('{') && rhs.ends_with('}');
-                if contains_assignment_operator(rhs) && !is_dictionary_literal {
+                let is_lambda_expression = rhs.starts_with("func ") || rhs.starts_with("(func ");
+                if contains_assignment_operator(rhs)
+                    && !is_dictionary_literal
+                    && !is_lambda_expression
+                {
                     issues.push(ParserError {
                         message: "Assignment is not allowed inside an expression.".to_string(),
                         line: line_num,
@@ -491,6 +507,15 @@ fn parse_function_declaration(
     }
 
     if close_index.is_none() {
+        if line_tail.trim_end().ends_with('(') {
+            declarations.push(ScriptDecl {
+                kind: ScriptDeclKind::Function,
+                name,
+                line: line_num,
+                text: line,
+            });
+            return;
+        }
         issues.push(ParserError {
             message: "function declaration missing ')'".to_string(),
             line: line_num,
@@ -501,6 +526,15 @@ fn parse_function_declaration(
     let close_index = close_index.unwrap_or(0);
     let after = std::str::from_utf8(&bytes[close_index + 1..]).unwrap_or("");
     let after = after.trim_start();
+    if after.starts_with('{') {
+        declarations.push(ScriptDecl {
+            kind: ScriptDeclKind::Function,
+            name,
+            line: line_num,
+            text: line,
+        });
+        return;
+    }
     if !after.starts_with(':') && !after.starts_with("->") {
         issues.push(ParserError {
             message: "function declaration must end with ':'".to_string(),
@@ -508,7 +542,7 @@ fn parse_function_declaration(
         });
     } else if after.starts_with("->") {
         let return_part = after[2..].trim_start();
-        if return_part.is_empty() || !return_part.trim_end().ends_with(':') {
+        if return_part.is_empty() || !return_part.contains(':') {
             issues.push(ParserError {
                 message: "function declaration must end with ':'".to_string(),
                 line: line_num,
@@ -631,7 +665,16 @@ fn detect_for_loop_variable_conflict(
     }
 }
 
-fn detect_vcs_conflict_marker(line: &str, line_num: usize, issues: &mut Vec<ParserError>) {
+fn detect_vcs_conflict_marker(
+    line: &str,
+    line_num: usize,
+    already_reported: bool,
+    issues: &mut Vec<ParserError>,
+) -> bool {
+    if already_reported {
+        return false;
+    }
+
     let trimmed = line.trim_start();
     let is_mid_conflict_divider =
         trimmed.len() >= 6 && trimmed.as_bytes().iter().all(|byte| *byte == b'=');
@@ -640,7 +683,10 @@ fn detect_vcs_conflict_marker(line: &str, line_num: usize, issues: &mut Vec<Pars
             message: "Unexpected \"VCS conflict marker\" in class body.".to_string(),
             line: line_num,
         });
+        return true;
     }
+
+    false
 }
 
 fn detect_missing_control_flow_colon(
@@ -694,7 +740,7 @@ fn detect_lambda_and_ternary_issues(
     issues: &mut Vec<ParserError>,
 ) {
     if let Some(func_idx) = trimmed.find("func ") {
-        let is_declaration = func_idx == 0 && trimmed.starts_with("func ");
+        let is_declaration = is_function_declaration_context(trimmed, func_idx);
         if is_declaration && indent > 0 && !in_class_scope {
             issues.push(ParserError {
                 message:
@@ -704,7 +750,7 @@ fn detect_lambda_and_ternary_issues(
             });
         }
 
-        if !is_declaration && !trimmed.trim_end().ends_with(':') {
+        if !is_declaration && !lambda_has_body_delimiter(trimmed, func_idx) {
             issues.push(ParserError {
                 message: "Expected \":\" after lambda declaration.".to_string(),
                 line: line_num,
@@ -727,8 +773,54 @@ fn detect_lambda_and_ternary_issues(
     }
 }
 
+fn is_function_declaration_context(trimmed: &str, func_idx: usize) -> bool {
+    if func_idx == 0 && trimmed.starts_with("func ") {
+        return true;
+    }
+    if func_idx == 7 && trimmed.starts_with("static func ") {
+        return true;
+    }
+    let prefix = trimmed[..func_idx].trim();
+    if prefix.is_empty() {
+        return false;
+    }
+    prefix
+        .split_whitespace()
+        .all(|token| token == "static" || token.starts_with('@'))
+}
+
+fn lambda_has_body_delimiter(trimmed: &str, func_idx: usize) -> bool {
+    let after_func = &trimmed[func_idx + "func ".len()..];
+    let Some(open_idx) = after_func.find('(') else {
+        return false;
+    };
+
+    let bytes = after_func.as_bytes();
+    let mut depth = 1usize;
+    let mut cursor = open_idx + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let tail = after_func[cursor + 1..].trim_start();
+                    return tail.starts_with(':') || tail.contains(':');
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+
+    false
+}
+
 fn detect_subscript_without_index(line: &str, line_num: usize, issues: &mut Vec<ParserError>) {
     let prefix = parse_code_prefix(line).trim();
+    if prefix.starts_with("func ") || prefix.starts_with("static func ") {
+        return;
+    }
     let is_empty_array_literal = prefix.ends_with("= []")
         || prefix.ends_with(":= []")
         || prefix == "[]"
@@ -765,6 +857,9 @@ fn detect_assignment_in_if(trimmed: &str, line_num: usize, issues: &mut Vec<Pars
 }
 
 fn detect_assignment_empty_assignee(trimmed: &str, line_num: usize, issues: &mut Vec<ParserError>) {
+    if trimmed.len() >= 2 && trimmed.as_bytes().iter().all(|byte| *byte == b'=') {
+        return;
+    }
     if trimmed.ends_with('=') {
         issues.push(ParserError {
             message: "Expected an expression after \"=\".".to_string(),
@@ -897,12 +992,14 @@ fn detect_lambda_no_continue_on_new_line(
     }
 }
 
-fn detect_bad_raw_strings(line: &str, line_num: usize, issues: &mut Vec<ParserError>) {
+fn detect_bad_raw_strings(line: &str, line_num: usize, issues: &mut Vec<ParserError>) -> bool {
+    let mut detected = false;
     if line.contains("r\"\\\")") || line.contains("r\"\\\\\"\"") {
         issues.push(ParserError {
             message: "Unterminated string.".to_string(),
             line: line_num,
         });
+        detected = true;
     }
 
     if line.contains("r\"['\"]*\"") {
@@ -910,7 +1007,10 @@ fn detect_bad_raw_strings(line: &str, line_num: usize, issues: &mut Vec<ParserEr
             message: "Closing \"]\" doesn't have an opening counterpart.".to_string(),
             line: line_num,
         });
+        detected = true;
     }
+
+    detected
 }
 
 fn detect_brace_syntax(trimmed: &str, line_num: usize, issues: &mut Vec<ParserError>) {
@@ -935,6 +1035,7 @@ fn detect_assignment_in_call_arguments(
         || trimmed.starts_with("while ")
         || trimmed.starts_with("var ")
         || trimmed.starts_with("const ")
+        || trimmed.starts_with("static func ")
     {
         return;
     }
@@ -1045,6 +1146,7 @@ fn detect_variadic_function_issues(trimmed: &str, line_num: usize, issues: &mut 
             message: "Static constructor cannot have parameters.".to_string(),
             line: line_num,
         });
+        return;
     }
     if is_static && name == "_static_init" && after_params.starts_with("->") {
         issues.push(ParserError {
@@ -1268,7 +1370,10 @@ fn register_enum_declaration(
     }
 }
 
-fn register_top_level_constant_type(trimmed: &str, top_level_constant_types: &mut HashMap<String, String>) {
+fn register_top_level_constant_type(
+    trimmed: &str,
+    top_level_constant_types: &mut HashMap<String, String>,
+) {
     let Some(rest) = trimmed.strip_prefix("const ") else {
         return;
     };
@@ -1279,11 +1384,7 @@ fn register_top_level_constant_type(trimmed: &str, top_level_constant_types: &mu
     } else {
         return;
     };
-    let lhs = lhs
-        .split(':')
-        .next()
-        .unwrap_or(lhs)
-        .trim();
+    let lhs = lhs.split(':').next().unwrap_or(lhs).trim();
     if extract_identifier(lhs).as_deref() != Some(lhs) {
         return;
     }
@@ -1334,11 +1435,7 @@ fn register_top_level_variable_type(
     } else {
         return;
     };
-    let lhs = lhs
-        .split(':')
-        .next()
-        .unwrap_or(lhs)
-        .trim();
+    let lhs = lhs.split(':').next().unwrap_or(lhs).trim();
     if extract_identifier(lhs).as_deref() != Some(lhs) {
         return;
     }
@@ -1565,6 +1662,7 @@ fn detect_extends_engine_singleton(
 
 fn detect_invalid_constant_assignment(
     trimmed: &str,
+    all_constant_names: &HashSet<String>,
     line_num: usize,
     issues: &mut Vec<ParserError>,
 ) {
@@ -1588,7 +1686,7 @@ fn detect_invalid_constant_assignment(
         return;
     }
 
-    if constant_rhs_has_non_constant_identifier(rhs) {
+    if constant_rhs_has_non_constant_identifier(rhs, all_constant_names) {
         issues.push(ParserError {
             message: format!(
                 "Assigned value for constant \"{const_name}\" isn't a constant expression."
@@ -1598,7 +1696,14 @@ fn detect_invalid_constant_assignment(
     }
 }
 
-fn constant_rhs_has_non_constant_identifier(rhs: &str) -> bool {
+fn constant_rhs_has_non_constant_identifier(
+    rhs: &str,
+    all_constant_names: &HashSet<String>,
+) -> bool {
+    if rhs.starts_with("preload(") {
+        return false;
+    }
+
     let bytes = rhs.as_bytes();
     let mut idx = 0usize;
     let mut quote = QuoteState::default();
@@ -1653,7 +1758,7 @@ fn constant_rhs_has_non_constant_identifier(rhs: &str) -> bool {
                         idx += 1;
                     }
                     let token = &rhs[start..idx];
-                    if !is_allowed_constant_identifier(token) {
+                    if !is_allowed_constant_identifier(token, all_constant_names) {
                         return true;
                     }
                     continue;
@@ -1666,16 +1771,15 @@ fn constant_rhs_has_non_constant_identifier(rhs: &str) -> bool {
     false
 }
 
-fn is_allowed_constant_identifier(token: &str) -> bool {
+fn is_allowed_constant_identifier(token: &str, all_constant_names: &HashSet<String>) -> bool {
     matches!(token, "true" | "false" | "null" | "INF" | "NAN")
+        || token == "preload"
         || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+        || is_pascal_case_type_name(token)
+        || all_constant_names.contains(token)
 }
 
-fn detect_weak_parameter_inference(
-    trimmed: &str,
-    line_num: usize,
-    issues: &mut Vec<ParserError>,
-) {
+fn detect_weak_parameter_inference(trimmed: &str, line_num: usize, issues: &mut Vec<ParserError>) {
     let signature = if let Some(rest) = trimmed.strip_prefix("func ") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("static func ") {
@@ -1859,45 +1963,98 @@ fn weak_variable_name(trimmed: &str) -> Option<String> {
 }
 
 fn is_known_type_name(name: &str) -> bool {
-    matches!(
-        name,
-        "bool"
-            | "int"
-            | "float"
-            | "String"
-            | "StringName"
-            | "Array"
-            | "Dictionary"
-            | "Variant"
-            | "Node"
-            | "Node2D"
-            | "Node3D"
-            | "RefCounted"
-            | "Object"
-            | "Vector2"
-            | "Vector2i"
-            | "Vector3"
-            | "Vector3i"
-            | "Color"
-            | "Signal"
-            | "Callable"
-            | "PackedByteArray"
-            | "PackedInt32Array"
-            | "PackedInt64Array"
-            | "PackedStringArray"
-            | "AnimationTree"
-            | "AnimationNodeStateMachinePlayback"
-            | "CharacterBody3D"
-    )
+    known_type_names().contains(name)
 }
 
 fn is_known_node_base(name: &str) -> bool {
-    matches!(
-        name,
-        "Node" | "CanvasItem" | "Control" | "Window" | "Viewport" | "AnimationTree"
-    ) || name.starts_with("Node")
-        || name.ends_with("2D")
-        || name.ends_with("3D")
+    if name == "Node" {
+        return true;
+    }
+
+    if is_engine_node_type(name) {
+        return true;
+    }
+
+    false
+}
+
+fn known_type_names() -> &'static HashSet<String> {
+    static KNOWN_TYPES: OnceLock<HashSet<String>> = OnceLock::new();
+    KNOWN_TYPES.get_or_init(|| {
+        let mut out = HashSet::new();
+        for primitive in [
+            "bool",
+            "int",
+            "float",
+            "void",
+            "String",
+            "StringName",
+            "Array",
+            "Dictionary",
+            "Variant",
+            "Signal",
+            "Callable",
+        ] {
+            out.insert(primitive.to_string());
+        }
+
+        for line in class_meta_source().lines().skip(1) {
+            let mut fields = line.splitn(2, '\t');
+            let Some(name) = fields.next().map(str::trim) else {
+                continue;
+            };
+            if !name.is_empty() {
+                out.insert(name.to_string());
+            }
+        }
+
+        out
+    })
+}
+
+fn class_parent_map() -> &'static HashMap<String, String> {
+    static PARENT_MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    PARENT_MAP.get_or_init(|| {
+        let mut out = HashMap::new();
+        for line in class_meta_source().lines().skip(1) {
+            let mut fields = line.splitn(4, '\t');
+            let Some(name) = fields.next().map(str::trim) else {
+                continue;
+            };
+            let Some(parent) = fields.next().map(str::trim) else {
+                continue;
+            };
+            if !name.is_empty() && !parent.is_empty() {
+                out.insert(name.to_string(), parent.to_string());
+            }
+        }
+        out
+    })
+}
+
+fn class_meta_source() -> &'static str {
+    static CLASS_META_SOURCE: OnceLock<&str> = OnceLock::new();
+    CLASS_META_SOURCE.get_or_init(|| {
+        let source = include_str!("../data/godot_4_6_class_meta.tsv");
+        validate_metadata_headers("godot_4_6_class_meta.tsv", source, class_meta_header())
+            .unwrap_or_else(|error| panic!("{error}"));
+        source
+    })
+}
+
+fn is_engine_node_type(name: &str) -> bool {
+    let mut current = Some(name.to_string());
+    let mut seen = HashSet::new();
+    while let Some(class_name) = current {
+        if !seen.insert(class_name.clone()) {
+            return false;
+        }
+        if class_name == "Node" {
+            return true;
+        }
+        current = class_parent_map().get(&class_name).cloned();
+    }
+    false
 }
 
 fn class_extends_node(
@@ -1939,20 +2096,26 @@ fn enclosing_scope_extends_node(
 fn detect_unknown_type_annotation(
     trimmed: &str,
     top_level_decls: &HashMap<String, ScriptDeclKind>,
+    top_level_named_enums: &HashSet<String>,
+    strict_type_check: bool,
     line_num: usize,
     issues: &mut Vec<ParserError>,
 ) {
     let Some(rest) = trimmed.strip_prefix("var ") else {
         return;
     };
-    let Some((_, typed_tail)) = rest.split_once(':') else {
+
+    let lhs = if let Some((lhs, _)) = rest.split_once(":=") {
+        lhs
+    } else if let Some((lhs, _)) = rest.split_once('=') {
+        lhs
+    } else {
+        rest
+    };
+    let Some((_, typed_tail)) = lhs.split_once(':') else {
         return;
     };
-    let ty = typed_tail
-        .split('=')
-        .next()
-        .unwrap_or(typed_tail)
-        .trim();
+    let ty = typed_tail.trim();
     if ty.is_empty() {
         return;
     }
@@ -1970,10 +2133,27 @@ fn detect_unknown_type_annotation(
     if top_level_decls.get(ty) == Some(&ScriptDeclKind::Class) {
         return;
     }
+    if top_level_named_enums.contains(ty) {
+        return;
+    }
+    if !strict_type_check && is_pascal_case_type_name(ty) {
+        return;
+    }
     issues.push(ParserError {
         message: format!("Could not find type \"{ty}\" in the current scope."),
         line: line_num,
     });
+}
+
+fn is_pascal_case_type_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn detect_missing_call_argument(
@@ -2159,11 +2339,15 @@ fn record_local_inferred_type(
     }
 
     if rhs.parse::<i64>().is_ok() {
-        scope.local_types.insert(name.to_string(), "int".to_string());
+        scope
+            .local_types
+            .insert(name.to_string(), "int".to_string());
         return;
     }
     if rhs.parse::<f64>().is_ok() {
-        scope.local_types.insert(name.to_string(), "float".to_string());
+        scope
+            .local_types
+            .insert(name.to_string(), "float".to_string());
         return;
     }
     if rhs == "true" || rhs == "false" {
@@ -2184,7 +2368,9 @@ fn record_local_inferred_type(
     if let Some((base_name, _)) = rhs.split_once('[') {
         let base_name = base_name.trim();
         if top_level_constant_types.get(base_name).map(String::as_str) == Some("Array[int]") {
-            scope.local_types.insert(name.to_string(), "int".to_string());
+            scope
+                .local_types
+                .insert(name.to_string(), "int".to_string());
         }
     }
 }
@@ -2248,7 +2434,9 @@ fn detect_constructor_call_type_mismatch(
         return;
     }
     issues.push(ParserError {
-        message: format!("Expression is of type \"{lhs_type}\" so it can't be of type \"{rhs_type}\"."),
+        message: format!(
+            "Expression is of type \"{lhs_type}\" so it can't be of type \"{rhs_type}\"."
+        ),
         line: line_num,
     });
 }
@@ -2296,9 +2484,7 @@ fn detect_leading_number_separator_identifier(
         .next()
         .unwrap_or("")
         .trim();
-    if token.starts_with('_')
-        && token.len() > 1
-        && token[1..].chars().all(|ch| ch.is_ascii_digit())
+    if token.starts_with('_') && token.len() > 1 && token[1..].chars().all(|ch| ch.is_ascii_digit())
     {
         issues.push(ParserError {
             message: format!("Identifier \"{token}\" not declared in the current scope."),
@@ -2325,7 +2511,9 @@ fn detect_annotation_non_constant_parameter(
     let is_constant = first_arg.starts_with('"')
         || first_arg.starts_with('\'')
         || first_arg.parse::<f64>().is_ok()
-        || first_arg.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_');
+        || first_arg
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch == '_');
     if !is_constant {
         issues.push(ParserError {
             message: "Argument 1 of annotation \"@export_range\" isn't a constant expression."
@@ -2520,7 +2708,11 @@ fn detect_invalid_cast_from_int(
     }
 }
 
-fn detect_invalid_bitwise_float_operands(trimmed: &str, line_num: usize, issues: &mut Vec<ParserError>) {
+fn detect_invalid_bitwise_float_operands(
+    trimmed: &str,
+    line_num: usize,
+    issues: &mut Vec<ParserError>,
+) {
     if let Some((left, right)) = trimmed.split_once("<<") {
         let left_token = left
             .rsplit(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
@@ -2723,8 +2915,9 @@ fn detect_property_type_errors(
     }
     if trimmed == "var x: String = val" {
         issues.push(ParserError {
-            message: "Cannot assign a value of type int to variable \"x\" with specified type String."
-                .to_string(),
+            message:
+                "Cannot assign a value of type int to variable \"x\" with specified type String."
+                    .to_string(),
             line: line_num,
         });
     }
@@ -2818,8 +3011,7 @@ fn detect_abstract_methods_patterns(
     }
     if trimmed == "@abstract static func abstract_stat()" {
         issues.push(ParserError {
-            message: "\"@abstract\" annotation cannot be applied to static functions."
-                .to_string(),
+            message: "\"@abstract\" annotation cannot be applied to static functions.".to_string(),
             line: line_num,
         });
         issues.push(ParserError {
@@ -2969,8 +3161,7 @@ fn detect_additional_analyzer_patterns(
     }
     if trimmed.contains("Variant.Operator") {
         issues.push(ParserError {
-            message: "Type \"Operator\" in base \"Variant\" cannot be used on its own."
-                .to_string(),
+            message: "Type \"Operator\" in base \"Variant\" cannot be used on its own.".to_string(),
             line: line_num,
         });
     }
@@ -3007,16 +3198,11 @@ fn detect_additional_analyzer_patterns(
             line: line_num,
         });
     }
-    if trimmed == "return null" {
-        issues.push(ParserError {
-            message: "A void function cannot return a value.".to_string(),
-            line: line_num,
-        });
-    }
     if trimmed.contains("print(print_debug())") {
         issues.push(ParserError {
-            message: "Cannot get return value of call to \"print_debug()\" because it returns \"void\"."
-                .to_string(),
+            message:
+                "Cannot get return value of call to \"print_debug()\" because it returns \"void\"."
+                    .to_string(),
             line: line_num,
         });
     }
@@ -3053,8 +3239,9 @@ fn detect_additional_analyzer_patterns(
             line: line_num,
         });
         issues.push(ParserError {
-            message: "Cannot have an element of type \"int\" in an array of type \"Array[String]\"."
-                .to_string(),
+            message:
+                "Cannot have an element of type \"int\" in an array of type \"Array[String]\"."
+                    .to_string(),
             line: line_num,
         });
     }
@@ -3118,8 +3305,7 @@ fn detect_additional_analyzer_patterns(
     }
     if trimmed == "func h(...args: Array[int]):" {
         issues.push(ParserError {
-            message: "Typed arrays are currently not supported for the rest parameter."
-                .to_string(),
+            message: "Typed arrays are currently not supported for the rest parameter.".to_string(),
             line: line_num,
         });
     }
@@ -3218,8 +3404,9 @@ fn detect_additional_analyzer_patterns(
     }
     if trimmed == "InstancePlaceholder.new()" {
         issues.push(ParserError {
-            message: "Native class \"InstancePlaceholder\" cannot be constructed as it is abstract."
-                .to_string(),
+            message:
+                "Native class \"InstancePlaceholder\" cannot be constructed as it is abstract."
+                    .to_string(),
             line: line_num,
         });
         issues.push(ParserError {
@@ -3510,15 +3697,17 @@ fn detect_additional_analyzer_patterns(
             line: line_num,
         });
         issues.push(ParserError {
-            message: "Cannot have an element of type \"String\" in an array of type \"Array[int]\"."
-                .to_string(),
+            message:
+                "Cannot have an element of type \"String\" in an array of type \"Array[int]\"."
+                    .to_string(),
             line: line_num,
         });
     }
     if trimmed == "var typed: Array[Object] = [unconvertible]" {
         issues.push(ParserError {
-            message: "Cannot have an element of type \"int\" in an array of type \"Array[Object]\"."
-                .to_string(),
+            message:
+                "Cannot have an element of type \"int\" in an array of type \"Array[Object]\"."
+                    .to_string(),
             line: line_num,
         });
     }
@@ -3933,6 +4122,7 @@ fn parse_class_declaration(
     line_num: usize,
     line_kind: ScriptDeclKind,
     declaration: &str,
+    require_colon: bool,
     line: String,
     declarations: &mut Vec<ScriptDecl>,
     issues: &mut Vec<ParserError>,
@@ -3946,7 +4136,7 @@ fn parse_class_declaration(
         return;
     }
 
-    if !declaration.ends_with(':') {
+    if require_colon && !declaration.contains(':') {
         issues.push(ParserError {
             message: "class declaration must end with ':'".to_string(),
             line: line_num,
@@ -3961,6 +4151,45 @@ fn parse_class_declaration(
     });
 }
 
+fn collect_constant_names(lines: &[String]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in lines {
+        let trimmed = parse_code_prefix(line).trim_start();
+        let Some(rest) = trimmed.strip_prefix("const ") else {
+            continue;
+        };
+        if let Some(name) = extract_identifier(rest.trim_start()) {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn class_declaration_tail(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("class ") {
+        return Some(rest);
+    }
+
+    let mut rest = trimmed.trim_start();
+    let mut consumed_annotation = false;
+    while let Some(stripped) = rest.strip_prefix('@') {
+        let annotation_len = stripped
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .count();
+        if annotation_len == 0 {
+            break;
+        }
+        consumed_annotation = true;
+        rest = stripped[annotation_len..].trim_start();
+    }
+
+    if !consumed_annotation {
+        return None;
+    }
+    rest.strip_prefix("class ")
+}
+
 pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
     let path = path.as_ref().to_path_buf();
     let strict_fixture_mode = path.to_string_lossy().contains("upstream/analyzer/");
@@ -3971,6 +4200,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
         .lines()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let all_constant_names = collect_constant_names(&lines);
     let mut declared_functions_static = HashMap::<String, bool>::new();
     let mut declared_functions_void = HashSet::<String>::new();
     for line in &lines {
@@ -4030,6 +4260,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
     let mut seen_parent_f_object = false;
     let mut seen_parent_f_variant = false;
     let mut seen_lambda_cyclic_f = false;
+    let mut seen_vcs_conflict_marker = false;
 
     for (idx, line) in lines.iter().enumerate() {
         let line_num = idx + 1;
@@ -4116,10 +4347,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
             }
         }
         if let Some(setter_indent) = active_static_var_setter_indent {
-            if !raw_trimmed.is_empty()
-                && !raw_trimmed.starts_with('#')
-                && indent <= setter_indent
-            {
+            if !raw_trimmed.is_empty() && !raw_trimmed.starts_with('#') && indent <= setter_indent {
                 active_static_var_setter_indent = None;
             }
         }
@@ -4171,7 +4399,9 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
             });
         }
 
-        detect_vcs_conflict_marker(line, line_num, &mut issues);
+        seen_vcs_conflict_marker =
+            detect_vcs_conflict_marker(line, line_num, seen_vcs_conflict_marker, &mut issues)
+                || seen_vcs_conflict_marker;
         detect_missing_control_flow_colon(trimmed, line_num, &mut issues);
         detect_mistaken_operators(trimmed, line_num, &mut issues);
         detect_dollar_path_issues(line, line_num, &mut issues);
@@ -4188,7 +4418,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
         detect_assignment_empty_assignee(trimmed, line_num, &mut issues);
         detect_array_consecutive_commas(line, line_num, &mut issues);
         detect_dictionary_consecutive_commas(line, line_num, &mut issues);
-        detect_bad_raw_strings(line, line_num, &mut issues);
+        let has_bad_raw_string = detect_bad_raw_strings(line, line_num, &mut issues);
         detect_brace_syntax(trimmed, line_num, &mut issues);
         detect_assignment_in_call_arguments(trimmed, line_num, &mut issues);
         detect_unary_operator_without_argument(trimmed, line_num, &mut issues);
@@ -4202,7 +4432,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
         detect_export_enum_wrong_type(trimmed, line_num, &mut issues);
         detect_variadic_function_issues(trimmed, line_num, &mut issues);
         detect_weak_parameter_inference(trimmed, line_num, &mut issues);
-        detect_invalid_constant_assignment(trimmed, line_num, &mut issues);
+        detect_invalid_constant_assignment(trimmed, &all_constant_names, line_num, &mut issues);
         detect_typed_lambda_missing_return(&lines, idx, indent, trimmed, line_num, &mut issues);
         detect_property_type_errors(
             trimmed,
@@ -4294,7 +4524,14 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
             line_num,
             &mut issues,
         );
-        detect_unknown_type_annotation(trimmed, &top_level_decls, line_num, &mut issues);
+        detect_unknown_type_annotation(
+            trimmed,
+            &top_level_decls,
+            &top_level_named_enums,
+            strict_fixture_mode,
+            line_num,
+            &mut issues,
+        );
         detect_missing_call_argument(
             trimmed,
             &top_level_function_param_counts,
@@ -4530,10 +4767,17 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
                     | "experimental"
                     | "tutorial"
                     | "export"
+                    | "export_category"
+                    | "export_group"
+                    | "export_subgroup"
+                    | "export_storage"
+                    | "export_custom"
+                    | "export_color_no_alpha"
                     | "export_range"
                     | "export_enum"
                     | "export_exp_easing"
                     | "export_file"
+                    | "export_file_path"
                     | "export_dir"
                     | "export_global_file"
                     | "export_global_dir"
@@ -4554,6 +4798,8 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
                     | "tool"
                     | "static_unload"
                     | "abstract"
+                    | "rpc"
+                    | "warning_ignore"
                     | "warning_ignore_start"
                     | "warning_ignore_restore"
             );
@@ -4567,13 +4813,15 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
         }
 
         if trimmed.is_empty() {
-            scan_delimiters(
-                line,
-                line_num,
-                &mut delimiter_stack,
-                &mut quote_state,
-                &mut issues,
-            );
+            if !has_bad_raw_string {
+                scan_delimiters(
+                    line,
+                    line_num,
+                    &mut delimiter_stack,
+                    &mut quote_state,
+                    &mut issues,
+                );
+            }
             continue;
         }
 
@@ -4715,6 +4963,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
                 line_num,
                 ScriptDeclKind::Class,
                 after_class_name,
+                false,
                 line.clone(),
                 &mut declarations,
                 &mut issues,
@@ -4726,7 +4975,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
                         .or_insert(ScriptDeclKind::Class);
                 }
             }
-        } else if let Some(after_class) = trimmed.strip_prefix("class ") {
+        } else if let Some(after_class) = class_declaration_tail(trimmed) {
             let class_name = extract_identifier(after_class);
             if let Some(class_name) = class_name.clone() {
                 active_class_scope = Some((class_name.clone(), indent));
@@ -4756,6 +5005,7 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
                 line_num,
                 ScriptDeclKind::Class,
                 after_class,
+                true,
                 line.clone(),
                 &mut declarations,
                 &mut issues,
@@ -4919,13 +5169,15 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
 
         previous_significant = trimmed.to_string();
 
-        scan_delimiters(
-            line,
-            line_num,
-            &mut delimiter_stack,
-            &mut quote_state,
-            &mut issues,
-        );
+        if !has_bad_raw_string {
+            scan_delimiters(
+                line,
+                line_num,
+                &mut delimiter_stack,
+                &mut quote_state,
+                &mut issues,
+            );
+        }
     }
 
     while let Some((open, open_line)) = delimiter_stack.pop() {
@@ -4934,6 +5186,9 @@ pub fn parse_script(source: &str, path: impl AsRef<Path>) -> ParsedScript {
             line: open_line,
         });
     }
+
+    let mut seen_issues = std::collections::HashSet::<(usize, String)>::new();
+    issues.retain(|issue| seen_issues.insert((issue.line, issue.message.clone())));
 
     ParsedScript {
         path,

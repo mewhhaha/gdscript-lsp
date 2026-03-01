@@ -3,6 +3,7 @@ mod harness;
 use gdscript_lsp::format_gdscript;
 use harness::run_cli_with_args;
 use harness::run_fixture_case;
+use serde_json::Value;
 use std::{env, fs, path::PathBuf, process};
 
 #[test]
@@ -132,5 +133,30 @@ fn format_write_updates_source_when_requested() {
         fs::read_to_string(&temp_path).unwrap(),
         expected_output,
         "formatted output should be written in place"
+    );
+}
+
+#[test]
+fn parity_report_json_command_returns_valid_payload() {
+    let (code, stdout, stderr) = run_cli_with_args(&["parity-report", "--json"], None);
+    assert_eq!(code, 0, "unexpected CLI exit code");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+
+    let parsed: Value = serde_json::from_str(&stdout).expect("parity report JSON");
+    assert!(
+        parsed.get("summary").is_some(),
+        "missing summary section: {parsed}"
+    );
+    assert!(
+        parsed.get("parser").is_some(),
+        "missing parser section: {parsed}"
+    );
+    assert!(
+        parsed.get("analyzer").is_some(),
+        "missing analyzer section: {parsed}"
+    );
+    assert!(
+        parsed.get("warnings").is_some(),
+        "missing warnings section: {parsed}"
     );
 }

@@ -429,8 +429,8 @@ fn normalize_comment(comment: &str) -> String {
 
 fn operator_at(bytes: &[u8], idx: usize) -> Option<&'static str> {
     const OPERATORS: [&str; 28] = [
-        "<<=", ">>=", "->", ":=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "==", "!=",
-        "<=", ">=", "<<", ">>", "&&", "||", "=", "+", "-", "*", "/", "%", "<", ">",
+        "<<=", ">>=", "->", ":=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "==", "!=", "<=",
+        ">=", "<<", ">>", "&&", "||", "=", "+", "-", "*", "/", "%", "<", ">",
     ];
 
     for operator in OPERATORS {
@@ -463,9 +463,8 @@ fn should_emit_space_between(prev: u8, next: u8) -> bool {
 }
 
 fn should_emit_space_before_operator(out: &str) -> bool {
-    previous_significant_byte(out.as_bytes(), out.len()).is_some_and(|byte| {
-        !matches!(byte, b'(' | b'[' | b'{' | b'.')
-    })
+    previous_significant_byte(out.as_bytes(), out.len())
+        .is_some_and(|byte| !matches!(byte, b'(' | b'[' | b'{' | b'.'))
 }
 
 fn should_emit_space_after(bytes: &[u8], idx: usize) -> bool {
@@ -560,16 +559,14 @@ mod tests {
     #[test]
     fn normalizes_assignment_and_binary_operator_spacing() {
         let source = "func _physics_process(delta):\n    velocity.y -=         _gravity * delta\n    x:=1\n    speed<<=2\n";
-        let expected =
-            "func _physics_process(delta):\n    velocity.y -= _gravity * delta\n    x := 1\n    speed <<= 2\n";
+        let expected = "func _physics_process(delta):\n    velocity.y -= _gravity * delta\n    x := 1\n    speed <<= 2\n";
         assert_eq!(format_gdscript(source), expected);
     }
 
     #[test]
     fn normalizes_commas_colons_and_return_arrow_spacing() {
         let source = "func move(v:Vector3)->void:\n    foo(a,b ,  c)\n    var d={\"hp\":100,\"name\" :\"Goblin\"}\n";
-        let expected =
-            "func move(v: Vector3) -> void:\n    foo(a, b, c)\n    var d = {\"hp\": 100, \"name\": \"Goblin\"}\n";
+        let expected = "func move(v: Vector3) -> void:\n    foo(a, b, c)\n    var d = {\"hp\": 100, \"name\": \"Goblin\"}\n";
         assert_eq!(format_gdscript(source), expected);
     }
 

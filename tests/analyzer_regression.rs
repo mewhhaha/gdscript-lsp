@@ -25,7 +25,9 @@ func test():
         "expected array mismatch diagnostic, got {messages:?}"
     );
     assert!(
-        messages.iter().all(|message| !message.contains("Dictionary[int, int]")),
+        messages
+            .iter()
+            .all(|message| !message.contains("Dictionary[int, int]")),
         "unexpected dictionary mismatch diagnostic in array case: {messages:?}"
     );
 }
@@ -57,7 +59,9 @@ func test():
         "expected dictionary mismatch diagnostic, got {messages:?}"
     );
     assert!(
-        messages.iter().all(|message| !message.contains("Array[int]")),
+        messages
+            .iter()
+            .all(|message| !message.contains("Array[int]")),
         "unexpected array mismatch diagnostic in dictionary case: {messages:?}"
     );
 }

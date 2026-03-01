@@ -24,13 +24,16 @@ fn upstream_analyzer_error_fixtures_map_to_expected_categories() {
             "function_used_as_property",
             "Cannot assign a new value to a constant.",
         ),
-        ("not_found_type", "Could not find type \"Foo\" in the current scope."),
         (
-            "missing_argument",
-            "Too few arguments for \"args()\" call.",
+            "not_found_type",
+            "Could not find type \"Foo\" in the current scope.",
         ),
+        ("missing_argument", "Too few arguments for \"args()\" call."),
         ("extend_unknown", "Could not find nested type \"Baz\"."),
-        ("extend_variable", "Cannot use variable \"A\" in extends chain."),
+        (
+            "extend_variable",
+            "Cannot use variable \"A\" in extends chain.",
+        ),
         (
             "call_not_existing_static_method",
             "Static function \"not_existing_method()\" not found in base \"MyClass\".",
@@ -115,18 +118,12 @@ fn upstream_analyzer_error_fixtures_map_to_expected_categories() {
             "assign_to_read_only_property",
             "Cannot assign a new value to a read-only property.",
         ),
-        (
-            "assign_signal",
-            "Cannot assign a new value to a constant.",
-        ),
+        ("assign_signal", "Cannot assign a new value to a constant."),
         (
             "assign_named_enum",
             "Cannot assign a new value to a constant.",
         ),
-        (
-            "assign_enum",
-            "Cannot assign a new value to a constant.",
-        ),
+        ("assign_enum", "Cannot assign a new value to a constant."),
         ("cyclic_inheritance", "Cyclic inheritance."),
         (
             "extend_engine_singleton",

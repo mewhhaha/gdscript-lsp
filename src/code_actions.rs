@@ -2,6 +2,7 @@ use crate::engine::BehaviorMode;
 use crate::formatter;
 use crate::lint::Diagnostic;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextRange {
@@ -28,6 +29,10 @@ pub struct CodeAction {
     pub title: String,
     pub kind: CodeActionKind,
     pub patch: CodeActionPatch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 pub fn code_actions_for_diagnostics(source: &str, diagnostics: &[Diagnostic]) -> Vec<CodeAction> {
@@ -59,6 +64,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "no-tabs" => {
@@ -78,6 +85,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "spaces-around-operator" => {
@@ -97,6 +106,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "max-line-length" => {
@@ -118,6 +129,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "todo-comment" => {
@@ -137,6 +150,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "unused-parameter" => {
@@ -157,6 +172,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "unused-variable" => {
@@ -177,6 +194,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "unused-local-constant" => {
@@ -197,6 +216,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "static-called-on-instance" => {
@@ -216,6 +237,8 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
                 })
             }
             "integer-division" => {
@@ -235,6 +258,71 @@ pub fn code_actions_for_diagnostics_and_mode(
                         line: diagnostic.line,
                         replacement,
                     },
+                    command: None,
+                    data: None,
+                })
+            }
+            "onready-with-export" => {
+                if !action_available_in_mode(CodeActionKindId::OnreadyWithExport, mode) {
+                    return None;
+                }
+                let current = source
+                    .lines()
+                    .nth(diagnostic.line.saturating_sub(1))
+                    .unwrap_or_default();
+                let replacement = remove_onready_annotation(current)?;
+
+                Some(CodeAction {
+                    title: "Remove @onready to keep export precedence".to_string(),
+                    kind: CodeActionKind::QuickFix,
+                    patch: CodeActionPatch {
+                        line: diagnostic.line,
+                        replacement,
+                    },
+                    command: None,
+                    data: None,
+                })
+            }
+            "get-node-default-without-onready" => {
+                if !action_available_in_mode(CodeActionKindId::GetNodeDefaultWithoutOnready, mode) {
+                    return None;
+                }
+                let current = source
+                    .lines()
+                    .nth(diagnostic.line.saturating_sub(1))
+                    .unwrap_or_default();
+                let replacement = add_onready_annotation(current)?;
+
+                Some(CodeAction {
+                    title: "Add @onready annotation".to_string(),
+                    kind: CodeActionKind::QuickFix,
+                    patch: CodeActionPatch {
+                        line: diagnostic.line,
+                        replacement,
+                    },
+                    command: None,
+                    data: None,
+                })
+            }
+            "standalone-expression" => {
+                if !action_available_in_mode(CodeActionKindId::StandaloneExpression, mode) {
+                    return None;
+                }
+                let current = source
+                    .lines()
+                    .nth(diagnostic.line.saturating_sub(1))
+                    .unwrap_or_default();
+                let replacement = discard_standalone_expression(current)?;
+
+                Some(CodeAction {
+                    title: "Consume standalone expression with discard".to_string(),
+                    kind: CodeActionKind::QuickFix,
+                    patch: CodeActionPatch {
+                        line: diagnostic.line,
+                        replacement,
+                    },
+                    command: None,
+                    data: None,
                 })
             }
             _ => None,
@@ -260,6 +348,9 @@ enum CodeActionKindId {
     UnusedLocalConstant,
     StaticCalledOnInstance,
     IntegerDivision,
+    OnreadyWithExport,
+    GetNodeDefaultWithoutOnready,
+    StandaloneExpression,
 }
 
 impl CodeActionKindId {
@@ -273,7 +364,10 @@ impl CodeActionKindId {
             | Self::UnusedVariable
             | Self::UnusedLocalConstant
             | Self::StaticCalledOnInstance
-            | Self::IntegerDivision => CodeActionRuleKind::Parity,
+            | Self::IntegerDivision
+            | Self::OnreadyWithExport
+            | Self::GetNodeDefaultWithoutOnready
+            | Self::StandaloneExpression => CodeActionRuleKind::Parity,
             Self::TodoComment => CodeActionRuleKind::Enhanced,
         }
     }
@@ -443,12 +537,259 @@ fn cast_left_operand_for_integer_division(line: &str) -> Option<String> {
     None
 }
 
+fn split_code_and_comment(line: &str) -> (&str, Option<&str>) {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                    idx += 1;
+                    continue;
+                }
+                if ch == b'\\' {
+                    escaped = true;
+                    idx += 1;
+                    continue;
+                }
+                if ch == q {
+                    quote = None;
+                }
+                idx += 1;
+            }
+            None => {
+                if ch == b'\'' || ch == b'"' {
+                    quote = Some(ch);
+                    idx += 1;
+                    continue;
+                }
+                if ch == b'#' {
+                    let code = line[..idx].trim_end();
+                    let comment = line[idx + 1..].trim();
+                    if comment.is_empty() {
+                        return (code, None);
+                    }
+                    return (code, Some(comment));
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    (line.trim_end(), None)
+}
+
+fn remove_onready_annotation(line: &str) -> Option<String> {
+    let (code, comment) = split_code_and_comment(line);
+    if !code.contains("@onready") || !code.contains("@export") {
+        return None;
+    }
+
+    let trimmed = code.trim_start();
+    let indent_len = code.len().saturating_sub(trimmed.len());
+    let indent = &code[..indent_len];
+
+    let mut body = String::new();
+    for token in trimmed.split_whitespace() {
+        if token == "@onready" {
+            continue;
+        }
+        if !body.is_empty() {
+            body.push(' ');
+        }
+        body.push_str(token);
+    }
+
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push_str(&body);
+    if let Some(comment) = comment {
+        out.push_str(" # ");
+        out.push_str(comment);
+    }
+
+    Some(out)
+}
+
+fn add_onready_annotation(line: &str) -> Option<String> {
+    let (code, comment) = split_code_and_comment(line);
+    if code.contains("@onready") {
+        return None;
+    }
+
+    let current = code.trim_start();
+    if !current.starts_with("var ") {
+        return None;
+    }
+
+    let indent_len = code.len().saturating_sub(current.len());
+    let indent = &code[..indent_len];
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push_str("@onready ");
+    out.push_str(current);
+    if let Some(comment) = comment {
+        out.push_str(" # ");
+        out.push_str(comment);
+    }
+    Some(out)
+}
+
+fn discard_standalone_expression(line: &str) -> Option<String> {
+    let (code, comment) = split_code_and_comment(line);
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let indent = &code[..code.len().saturating_sub(code.trim_start().len())];
+    let mut out = format!("{indent}_ = {trimmed}");
+    if let Some(comment) = comment {
+        out.push_str(" # ");
+        out.push_str(comment);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fix_assignment_spacing;
+    use super::{
+        add_onready_annotation, code_actions_for_diagnostics, discard_standalone_expression,
+        fix_assignment_spacing, remove_onready_annotation,
+    };
+    use crate::lint::{Diagnostic, DiagnosticLevel};
+
+    fn mk_diag(code: &str, line: usize, message: &str, level: DiagnosticLevel) -> Diagnostic {
+        Diagnostic {
+            file: None,
+            line,
+            column: 1,
+            code: code.to_string(),
+            level,
+            message: message.to_string(),
+        }
+    }
 
     #[test]
     fn formats_simple_assignment() {
         assert_eq!(fix_assignment_spacing("a=1"), "a = 1");
+    }
+
+    #[test]
+    fn remove_onready_annotation_action() {
+        let source = "@export @onready var value = 1\n";
+        let actions = code_actions_for_diagnostics(
+            source,
+            &[mk_diag(
+                "onready-with-export",
+                1,
+                "rule",
+                DiagnosticLevel::Warning,
+            )],
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].title,
+            "Remove @onready to keep export precedence"
+        );
+        assert_eq!(
+            actions[0].patch.replacement, "@export var value = 1",
+            "onready-with-export fix should remove redundant decorator"
+        );
+    }
+
+    #[test]
+    fn add_onready_annotation_action() {
+        let source = "var node = get_node(\"%Player\")\n";
+        let actions = code_actions_for_diagnostics(
+            source,
+            &[mk_diag(
+                "get-node-default-without-onready",
+                1,
+                "rule",
+                DiagnosticLevel::Warning,
+            )],
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].title, "Add @onready annotation");
+        assert_eq!(
+            actions[0].patch.replacement, "@onready var node = get_node(\"%Player\")",
+            "onready fix should add @onready annotation"
+        );
+    }
+
+    #[test]
+    fn consume_standalone_expression_action() {
+        let source = "    1 + 2\n";
+        let actions = code_actions_for_diagnostics(
+            source,
+            &[mk_diag(
+                "standalone-expression",
+                1,
+                "rule",
+                DiagnosticLevel::Warning,
+            )],
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].title,
+            "Consume standalone expression with discard"
+        );
+        assert_eq!(
+            actions[0].patch.replacement, "    _ = 1 + 2",
+            "standalone-expression should become explicit discard assignment"
+        );
+    }
+
+    #[test]
+    fn helper_remove_onready_annotation() {
+        assert_eq!(
+            remove_onready_annotation("@export @onready var value = 1"),
+            Some("@export var value = 1".to_string())
+        );
+    }
+
+    #[test]
+    fn helper_add_onready_annotation() {
+        assert_eq!(
+            add_onready_annotation("var node = get_node(\"%Player\")"),
+            Some("@onready var node = get_node(\"%Player\")".to_string())
+        );
+    }
+
+    #[test]
+    fn helper_discard_standalone_expression() {
+        assert_eq!(
+            discard_standalone_expression("    value"),
+            Some("    _ = value".to_string())
+        );
+    }
+
+    #[test]
+    fn helper_split_comment_respects_string_literals() {
+        assert_eq!(
+            remove_onready_annotation("    @export @onready var label = \"#x\" # hello"),
+            Some("    @export var label = \"#x\" # hello".to_string())
+        );
+    }
+
+    #[test]
+    fn helper_discard_preserves_comment() {
+        assert_eq!(
+            discard_standalone_expression("    value_call() # keep"),
+            Some("    _ = value_call() # keep".to_string())
+        );
     }
 }

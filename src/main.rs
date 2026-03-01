@@ -2,8 +2,8 @@ use clap::Parser;
 use std::process;
 
 use gdscript_lsp::{
-    Cli, Commands, check_command, format_command, lint_command, lsp, resolve_engine_config,
-    rules_command,
+    Cli, Commands, check_command, format_command, lint_command, lsp, parity_report_command,
+    resolve_engine_config, rules_command,
 };
 
 fn main() {
@@ -37,6 +37,11 @@ fn main() {
             cli.global.mode,
         ),
         Commands::Rules => rules_command(),
+        Commands::ParityReport {
+            json,
+            strict,
+            limit,
+        } => parity_report_command(json, strict, limit),
     };
 
     if let Err(err) = result {

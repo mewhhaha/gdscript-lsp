@@ -1,5 +1,6 @@
 mod cli;
 pub mod code_actions;
+mod docs_meta;
 pub mod engine;
 pub mod formatter;
 pub mod hover;

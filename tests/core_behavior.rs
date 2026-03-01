@@ -172,9 +172,8 @@ var playback: AnimationNodeStateMachinePlayback
         .collect::<Vec<_>>();
 
     assert!(
-        !messages.iter().any(|message| message.contains(
-            "Assigned value for constant \"FALL_STATE\" isn't a constant expression."
-        )),
+        !messages.iter().any(|message| message
+            .contains("Assigned value for constant \"FALL_STATE\" isn't a constant expression.")),
         "unexpected constant-expression diagnostic: {messages:?}"
     );
     assert!(
@@ -184,9 +183,8 @@ var playback: AnimationNodeStateMachinePlayback
         "unexpected export_range diagnostic: {messages:?}"
     );
     assert!(
-        !messages.iter().any(|message| message.contains(
-            "\"@onready\" can only be used in classes that inherit \"Node\"."
-        )),
+        !messages.iter().any(|message| message
+            .contains("\"@onready\" can only be used in classes that inherit \"Node\".")),
         "unexpected @onready inheritance diagnostic: {messages:?}"
     );
     assert!(
@@ -200,6 +198,109 @@ var playback: AnimationNodeStateMachinePlayback
             "Could not find type \"AnimationNodeStateMachinePlayback\" in the current scope."
         )),
         "unexpected unknown type diagnostic: {messages:?}"
+    );
+}
+
+#[test]
+fn parser_accepts_common_native_godot_types_in_normal_scripts() {
+    let source = r#"
+extends Camera3D
+
+var shader_material: ShaderMaterial
+var rng: RandomNumberGenerator = RandomNumberGenerator.new()
+var pixel_tween: Tween
+"#;
+    let parsed = parse_script(source, "native_types_normal_script.gd");
+    let messages = parsed
+        .issues
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Could not find type \"ShaderMaterial\"")),
+        "unexpected unknown-type diagnostic for ShaderMaterial: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .contains("Could not find type \"RandomNumberGenerator\" in the current scope.")),
+        "unexpected unknown-type diagnostic for RandomNumberGenerator: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Could not find type \"Tween\" in the current scope.")),
+        "unexpected unknown-type diagnostic for Tween: {messages:?}"
+    );
+}
+
+#[test]
+fn parser_recognizes_common_godot4_annotations() {
+    let source = r#"
+extends Camera3D
+
+@export_group("Impact Distortion")
+@export_range(0.0, 16.0, 0.1) var impact_pixel_boost: float = 10.0
+@export_subgroup("Falloff")
+@export var fall_enabled: bool = true
+@export_file_path("*.png") var icon_path: String
+@export_category("Debug")
+@export_color_no_alpha var tint: Color = Color(1, 1, 1)
+@warning_ignore("unused_parameter")
+@rpc("any_peer", "call_local")
+func replicate(_delta: float) -> void:
+    pass
+"#;
+    let parsed = parse_script(source, "recognized_annotations.gd");
+    let messages = parsed
+        .issues
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@export_group\"")),
+        "unexpected @export_group diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@export_subgroup\"")),
+        "unexpected @export_subgroup diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@export_file_path\"")),
+        "unexpected @export_file_path diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@export_category\"")),
+        "unexpected @export_category diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@export_color_no_alpha\"")),
+        "unexpected @export_color_no_alpha diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@warning_ignore\"")),
+        "unexpected @warning_ignore diagnostic: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("Unrecognized annotation: \"@rpc\"")),
+        "unexpected @rpc diagnostic: {messages:?}"
     );
 }
 

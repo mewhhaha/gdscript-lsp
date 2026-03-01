@@ -81,6 +81,18 @@ pub enum Commands {
     },
     /// Print available lint rule names.
     Rules,
+    /// Report fixture parity gaps versus upstream snapshots.
+    ParityReport {
+        /// Emit report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Fail with non-zero exit if any gaps are found.
+        #[arg(long)]
+        strict: bool,
+        /// Maximum entries per mismatch section in text output.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 impl From<LintRuleOverrides> for crate::lint::LintOverrides {
