@@ -353,7 +353,47 @@ fn hover_method_returns_builtin_payload() {
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    print(\\\"x\\\")\\n\",\"line\":2,\"character\":7}}\n{\"method\":\"exit\"}\n",
     );
 
-    assert!(output.contains("print"), "output: {output}");
+    assert!(
+        output.contains("```gdscript\\nfunc print(...args: Array[Variant]) -> void:\\n```")
+            || output.contains("```gdscript\\nfunc print(...args: Array[Variant]):\\n```"),
+        "builtin hover should use gdscript signature block: {output}"
+    );
+    assert!(
+        !output.contains("builtin print"),
+        "builtin prefix should not be rendered in hover: {output}"
+    );
+}
+
+#[test]
+fn hover_method_returns_push_error_builtin_payload() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    push_error(\\\"x\\\")\\n\",\"line\":2,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nfunc push_error(...args: Array[Variant]) -> void:\\n```"),
+        "push_error hover should include gdscript signature block: {output}"
+    );
+    assert!(
+        output.contains("Pushes an error message"),
+        "push_error hover should include builtin docs summary: {output}"
+    );
+}
+
+#[test]
+fn hover_method_returns_push_error_builtin_payload_with_implicit_receiver_context() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"extends Node\\nfunc _ready():\\n    push_error(\\\"x\\\")\\n\",\"line\":3,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nfunc push_error(...args: Array[Variant]) -> void:\\n```"),
+        "push_error hover should include gdscript signature block with implicit receiver context: {output}"
+    );
+    assert!(
+        output.contains("Pushes an error message"),
+        "push_error hover should include builtin docs summary with implicit receiver context: {output}"
+    );
 }
 
 #[test]
@@ -367,8 +407,8 @@ fn hover_method_returns_node_method_payload() {
         "hover should include node method symbol: {output}"
     );
     assert!(
-        output.contains("Node method"),
-        "hover should include node method context: {output}"
+        output.contains("```gdscript\\nfunc queue_free() -> void:\\n```"),
+        "hover should include method type signature block: {output}"
     );
 }
 
@@ -393,7 +433,10 @@ fn hover_on_type_uses_local_declaration_context() {
     );
 
     assert!(output.contains("class"), "output: {output}");
-    assert!(output.contains("Type: `type`"), "output: {output}");
+    assert!(
+        output.contains("```gdscript\\nclass Player:\\n```"),
+        "output: {output}"
+    );
     assert!(output.contains("Player entity"), "output: {output}");
 }
 
@@ -403,8 +446,94 @@ fn hover_on_literal_includes_literal_type() {
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    print(42)\\n\",\"line\":2,\"character\":12}}\n{\"method\":\"exit\"}\n",
     );
 
-    assert!(output.contains("Type: `int`"), "output: {output}");
-    assert!(output.contains("Value: `42`"), "output: {output}");
+    assert!(
+        output.contains("```gdscript\\nconst value: int = 42\\n```"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_stringname_literal_includes_stringname_type() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready():\\n    print(&\\\"hello\\\")\\n\",\"line\":2,\"character\":13}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nconst value: StringName = &\\\"hello\\\"\\n```"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_signal_includes_signal_signature_block() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"signal landed(impact_speed: float)\\nsignal landed_intensity(impact_speed: float, impact_intensity: float)\\nfunc _ready() -> void:\\n    landed.emit(1.0)\\n\",\"line\":4,\"character\":7}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nsignal landed(impact_speed: float)\\n```"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_signal_parameter_includes_parameter_type_block() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"signal landed(impact_speed: float)\\n\",\"line\":1,\"character\":20}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nimpact_speed: float\\n```"),
+        "output: {output}"
+    );
+    assert!(
+        output.contains("Signal: `signal landed(impact_speed: float)`"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn hover_on_keyword_and_annotation_includes_docs() {
+    let source = "@onready var player = get_node(\".\")\nconst SPEED: float = 1.0\nfunc _ready() -> void:\n    for i in [1]:\n        pass\n";
+    let escaped_source = source
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&escaped_source);
+    requests.push_str("\",\"line\":2,\"character\":2}}\n");
+    requests.push_str("{\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&escaped_source);
+    requests.push_str("\",\"line\":4,\"character\":5}}\n");
+    requests.push_str("{\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&escaped_source);
+    requests.push_str("\",\"line\":1,\"character\":3}}\n");
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let const_hover = response_by_id(&responses, 1).expect("const hover");
+    let for_hover = response_by_id(&responses, 2).expect("for hover");
+    let onready_hover = response_by_id(&responses, 3).expect("onready hover");
+
+    assert!(
+        const_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("```gdscript\nconst NAME: Type = value\n```")),
+        "const hover should include keyword docs: {const_hover:#?}"
+    );
+    assert!(
+        for_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("```gdscript\nfor item in iterable:\n```")),
+        "for hover should include keyword docs: {for_hover:#?}"
+    );
+    assert!(
+        onready_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("```gdscript\n@onready var value = expr\n```")),
+        "annotation hover should include onready docs: {onready_hover:#?}"
+    );
 }
 
 #[test]
@@ -414,7 +543,7 @@ fn hover_on_typed_receiver_method_uses_docs_metadata() {
     );
 
     assert!(
-        output.contains("RandomNumberGenerator method randomize() -> void"),
+        output.contains("```gdscript\\nfunc randomize() -> void:\\n```"),
         "output: {output}"
     );
     assert!(output.contains("time-based seed"), "output: {output}");
@@ -427,7 +556,7 @@ fn hover_on_typed_receiver_method_uses_inherited_docs_metadata() {
     );
 
     assert!(
-        output.contains("Node method queue_free() -> void"),
+        output.contains("```gdscript\\nfunc queue_free() -> void:\\n```"),
         "output: {output}"
     );
     assert!(
@@ -443,7 +572,7 @@ fn hover_on_chained_typed_receiver_method_uses_docs_metadata() {
     );
 
     assert!(
-        output.contains("RandomNumberGenerator method randomize() -> void"),
+        output.contains("```gdscript\\nfunc randomize() -> void:\\n```"),
         "output: {output}"
     );
 }
@@ -454,11 +583,7 @@ fn hover_on_property_chain_uses_typed_receiver_for_property_and_method() {
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\\n    _player.stream.get_length()\\n\",\"line\":3,\"character\":14}}\n{\"method\":\"exit\"}\n",
     );
     assert!(
-        property_output.contains("AudioStreamPlayer property stream: AudioStream"),
-        "output: {property_output}"
-    );
-    assert!(
-        property_output.contains("Type: `AudioStream`"),
+        property_output.contains("```gdscript\\nvar stream: AudioStream\\n```"),
         "output: {property_output}"
     );
 
@@ -466,7 +591,7 @@ fn hover_on_property_chain_uses_typed_receiver_for_property_and_method() {
         "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _player: AudioStreamPlayer = AudioStreamPlayer.new()\\n    _player.stream.get_length()\\n\",\"line\":3,\"character\":21}}\n{\"method\":\"exit\"}\n",
     );
     assert!(
-        method_output.contains("AudioStream method get_length() -> float"),
+        method_output.contains("```gdscript\\nfunc get_length() -> float:\\n```"),
         "output: {method_output}"
     );
     assert!(
@@ -482,12 +607,85 @@ fn hover_on_property_inside_call_argument_keeps_member_symbol() {
     );
 
     assert!(
-        output.contains("AudioStreamPlayer property stream: AudioStream"),
+        output.contains("```gdscript\\nvar stream: AudioStream\\n```"),
         "output: {output}"
     );
     assert!(
         !output.contains("var max_offset"),
         "hover should not backtrack to assignment target: {output}"
+    );
+}
+
+#[test]
+fn hover_on_chained_builtin_value_property_uses_component_docs() {
+    let output = run_lsp(
+        "{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"func _ready() -> void:\\n    var _visual: Node3D = Node3D.new()\\n    var _base_visual_yaw = _visual.rotation.y\\n\",\"line\":3,\"character\":45}}\n{\"method\":\"exit\"}\n",
+    );
+
+    assert!(
+        output.contains("```gdscript\\nvar y: float\\n```"),
+        "output: {output}"
+    );
+    assert!(output.contains("Y component"), "output: {output}");
+}
+
+#[test]
+fn hover_on_global_float_helpers_is_not_ambiguous_and_infers_float_bindings() {
+    let source = "func _ready() -> void:\n    _impact_sfx.volume_db = lerpf(impact_volume_min_db, impact_volume_max_db, intensity)\n    var max_offset := maxf(_impact_sfx.stream.get_length() - 0.001, 0.0)\n    var start_offset := minf(impact_sound_start_seconds, max_offset)\n    _impact_sfx.play(start_offset)\n";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&source.replace('\\', "\\\\").replace('\n', "\\n"));
+    requests.push_str("\",\"line\":2,\"character\":29}}\n");
+    requests.push_str("{\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&source.replace('\\', "\\\\").replace('\n', "\\n"));
+    requests.push_str("\",\"line\":3,\"character\":24}}\n");
+    requests.push_str("{\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&source.replace('\\', "\\\\").replace('\n', "\\n"));
+    requests.push_str("\",\"line\":4,\"character\":27}}\n");
+    requests.push_str("{\"id\":4,\"method\":\"textDocument/hover\",\"params\":{\"text\":\"");
+    requests.push_str(&source.replace('\\', "\\\\").replace('\n', "\\n"));
+    requests.push_str("\",\"line\":3,\"character\":10}}\n");
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let lerpf_hover = response_by_id(&responses, 1).expect("lerpf hover");
+    let maxf_hover = response_by_id(&responses, 2).expect("maxf hover");
+    let minf_hover = response_by_id(&responses, 3).expect("minf hover");
+    let max_offset_hover = response_by_id(&responses, 4).expect("max_offset hover");
+
+    assert!(
+        lerpf_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| {
+                value.contains(
+                    "```gdscript\nfunc lerpf(from: float, to: float, weight: float) -> float:\n```",
+                )
+            }),
+        "lerpf hover should expose global float signature: {lerpf_hover:#?}"
+    );
+    assert!(
+        maxf_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| {
+                !value.contains("ambiguous method")
+                    && value.contains("```gdscript\nfunc maxf(a: float, b: float) -> float:\n```")
+            }),
+        "maxf should not resolve as ambiguous method: {maxf_hover:#?}"
+    );
+    assert!(
+        minf_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| {
+                !value.contains("ambiguous method")
+                    && value.contains("```gdscript\nfunc minf(a: float, b: float) -> float:\n```")
+            }),
+        "minf should not resolve as ambiguous method: {minf_hover:#?}"
+    );
+    assert!(
+        max_offset_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("var max_offset: float = maxf(")),
+        "max_offset should infer float from maxf return type: {max_offset_hover:#?}"
     );
 }
 
@@ -504,6 +702,30 @@ fn hover_on_ambiguous_method_reports_candidates() {
     assert!(
         output.contains("Multiple Godot methods match"),
         "output: {output}"
+    );
+}
+
+#[test]
+fn signature_help_prefers_global_float_helper_over_unqualified_method_candidates() {
+    let source = "func _ready() -> void:\n    var max_offset := maxf(_impact_sfx.stream.get_length() - 0.001, 0.0)\n";
+    let mut requests = String::new();
+    requests.push_str("{\"id\":1,\"method\":\"initialize\"}\n");
+    requests
+        .push_str("{\"id\":2,\"method\":\"textDocument/signatureHelp\",\"params\":{\"text\":\"");
+    requests.push_str(&source.replace('\\', "\\\\").replace('\n', "\\n"));
+    requests.push_str("\",\"line\":2,\"character\":31}}\n");
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let signature_help = response_by_id(&responses, 2).expect("signatureHelp response");
+    let signatures = signature_help["result"]["signatures"]
+        .as_array()
+        .expect("signatures array");
+    assert!(
+        signatures
+            .iter()
+            .any(|entry| entry["label"].as_str() == Some("maxf(a: float, b: float) -> float")),
+        "signatureHelp should resolve maxf global signature: {signature_help:#?}"
     );
 }
 
@@ -547,12 +769,14 @@ fn hover_handles_shadowing_nested_scope_and_multiline_function_sections() {
         .as_str()
         .unwrap_or("");
     assert!(
-        function_contents.contains("Parameters: player_name: String, multiplier: float = 1.0"),
-        "multiline function hover should include parameter section: {function_hover:#?}"
+        function_contents.contains("```gdscript\nfunc compute_score("),
+        "function hover should include gdscript signature block: {function_hover:#?}"
     );
     assert!(
-        function_contents.contains("Returns: `int`"),
-        "function hover should include return type section: {function_hover:#?}"
+        function_contents.contains("player_name: String")
+            && function_contents.contains("multiplier: float = 1.0")
+            && function_contents.contains("-> int:"),
+        "function hover should include typed parameters and return type: {function_hover:#?}"
     );
 }
 
@@ -579,14 +803,21 @@ fn hover_type_sections_include_inheritance_and_enum_members() {
     assert!(
         actor_hover["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("Inherits: `BaseEntity`")),
-        "class hover should include inheritance section: {actor_hover:#?}"
+            .is_some_and(|value| {
+                value.contains("```gdscript\nclass Actor extends BaseEntity:\n```")
+            }),
+        "class hover should include gdscript class declaration block: {actor_hover:#?}"
     );
     assert!(
         enum_hover["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("Members: IDLE, RUNNING, JUMPING")),
-        "enum hover should include enum member list: {enum_hover:#?}"
+            .is_some_and(|value| {
+                value.contains("```gdscript\nenum State {")
+                    && value.contains("IDLE")
+                    && value.contains("RUNNING")
+                    && value.contains("JUMPING")
+            }),
+        "enum hover should include gdscript enum declaration block: {enum_hover:#?}"
     );
 }
 
@@ -621,7 +852,7 @@ fn docs_parity_fixture_covers_typed_hover_and_ambiguous_fallbacks() {
     assert!(
         typed_hover["result"]["contents"]["value"]
             .as_str()
-            .is_some_and(|value| value.contains("RandomNumberGenerator method randomize() -> void")),
+            .is_some_and(|value| value.contains("```gdscript\nfunc randomize() -> void:\n```")),
         "typed hover should match RandomNumberGenerator docs: {typed_hover:#?}"
     );
     assert!(
@@ -1604,6 +1835,43 @@ fn completion_on_typed_receiver_uses_snippet_insert_for_method_args() {
 }
 
 #[test]
+fn completion_on_typed_receiver_includes_property_entries() {
+    let source =
+        "func _ready() -> void:\n    var node: Node3D = Node3D.new()\n    node.rotation.\n";
+    let uri = "file:///tmp/fixtures/gdscript-lsp-property-completion.gd";
+
+    let mut requests = String::new();
+    requests.push_str(&frame_message(r#"{"id":1,"method":"initialize"}"#));
+    requests.push_str(&frame_message(&did_open_message(uri, source)));
+    requests.push_str(&frame_message(
+        r#"{"id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///tmp/fixtures/gdscript-lsp-property-completion.gd"},"position":{"line":2,"character":18}}}"#,
+    ));
+    requests.push_str(&frame_message(r#"{"method":"exit"}"#));
+
+    let responses = parse_framed_output(&run_lsp(&requests));
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let y_item = completion["result"]["items"]
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .find(|entry| entry["label"] == "y")
+        .cloned()
+        .expect("y completion");
+
+    assert_eq!(
+        y_item["kind"].as_u64(),
+        Some(10),
+        "property completion should use CompletionItemKind::Property: {y_item:#?}"
+    );
+    assert!(
+        y_item["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("var y: float (Vector3)")),
+        "property completion detail should expose inferred type: {y_item:#?}"
+    );
+}
+
+#[test]
 fn signature_help_on_typed_receiver_uses_docs_and_active_parameter() {
     let source = "func _ready():\n    var rng: RandomNumberGenerator = RandomNumberGenerator.new()\n    rng.randi_range(1, 2)\n";
     let uri = "file:///tmp/fixtures/gdscript-lsp-signaturehelp-typed.gd";
@@ -1725,6 +1993,249 @@ fn initialize_completion_includes_project_class_and_autoload_symbols() {
         class_labels.contains("CombatDirector"),
         "completion should include class_name symbols from workspace: {class_completion:#?}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_with_dollar_uses_children_from_attached_scene() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gdscript-lsp-dollar-completion-{stamp}"));
+    fs::create_dir_all(&root).expect("create workspace root");
+
+    fs::write(
+        root.join("project.godot"),
+        "[application]\nconfig/name=\"gdscript_lsp_test\"\n",
+    )
+    .expect("write project.godot");
+    fs::write(
+        root.join("player.gd"),
+        "extends Node3D\n\nfunc _ready() -> void:\n    $\n",
+    )
+    .expect("write attached script");
+    fs::write(
+        root.join("test_scene.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n\n[node name=\"Root\" type=\"Node3D\"]\nscript = ExtResource(\"1\")\n[node name=\"ChildA\" type=\"Node3D\" parent=\".\"]\n[node name=\"ChildB\" type=\"Node3D\" parent=\".\"]\n[node name=\"Nested\" type=\"Node3D\" parent=\"ChildA\"]\n",
+    )
+    .expect("write scene");
+
+    let root_uri = file_uri(&root);
+    let script_uri = file_uri(&root.join("player.gd"));
+    let init = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root_uri
+        }
+    }))
+    .expect("init request");
+
+    let completion = serde_json::to_string(&json!({
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": script_uri.clone() },
+            "position": { "line": 4, "character": 5 },
+        }
+    }))
+    .expect("completion request");
+
+    let mut requests = String::new();
+    requests.push_str(&init);
+    requests.push('\n');
+    requests.push_str(&did_open_message(&script_uri, "extends Node3D\n\nfunc _ready() -> void:\n    $\n"));
+    requests.push('\n');
+    requests.push_str(&completion);
+    requests.push('\n');
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let items = completion["result"]["items"]
+        .as_array()
+        .expect("completion items");
+    let item_labels: HashSet<String> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect();
+
+    assert!(item_labels.contains("ChildA"));
+    assert!(item_labels.contains("ChildB"));
+
+    let child_a = items
+        .iter()
+        .find(|item| item["label"] == "ChildA")
+        .expect("ChildA completion item");
+    let child_a_insert = child_a["textEdit"]["newText"]
+        .as_str()
+        .or_else(|| child_a["insertText"].as_str())
+        .or_else(|| child_a["label"].as_str())
+        .expect("ChildA insert text");
+    assert_eq!(child_a_insert, "ChildA");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_for_get_node_completes_scene_paths_in_string() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gdscript-lsp-get-node-completion-{stamp}"));
+    fs::create_dir_all(&root).expect("create workspace root");
+
+    fs::write(
+        root.join("project.godot"),
+        "[application]\nconfig/name=\"gdscript_lsp_test\"\n",
+    )
+    .expect("write project.godot");
+    fs::write(
+        root.join("player.gd"),
+        "extends Node3D\n\nfunc _ready() -> void:\n    var node = get_node(\"We\")\n",
+    )
+    .expect("write attached script");
+    fs::write(
+        root.join("test_scene.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n\n[node name=\"Root\" type=\"Node3D\"]\nscript = ExtResource(\"1\")\n[node name=\"Weapon\" type=\"Node3D\" parent=\".\"]\n[node name=\"Scope\" type=\"Node3D\" parent=\".\"]\n[node name=\"WeaponFlash\" type=\"Node3D\" parent=\"Weapon\"]\n",
+    )
+    .expect("write scene");
+
+    let root_uri = file_uri(&root);
+    let script_uri = file_uri(&root.join("player.gd"));
+    let init = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root_uri
+        }
+    }))
+    .expect("init request");
+
+    let completion = serde_json::to_string(&json!({
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": script_uri.clone() },
+            "position": { "line": 4, "character": 27 },
+        }
+    }))
+    .expect("completion request");
+
+    let mut requests = String::new();
+    requests.push_str(&init);
+    requests.push('\n');
+    requests.push_str(&did_open_message(&script_uri, "extends Node3D\n\nfunc _ready() -> void:\n    var node = get_node(\"We\")\n"));
+    requests.push('\n');
+    requests.push_str(&completion);
+    requests.push('\n');
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let items = completion["result"]["items"]
+        .as_array()
+        .expect("completion items");
+
+    let labels: Vec<String> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(labels.iter().any(|label| label.contains("Weapon")));
+    let weapon = items
+        .iter()
+        .find(|item| item["label"].as_str().is_some_and(|label| label.contains("Weapon")))
+        .expect("Weapon completion item");
+    let insert_text = weapon["textEdit"]["newText"]
+        .as_str()
+        .or_else(|| weapon["insertText"].as_str())
+        .or_else(|| weapon["label"].as_str())
+        .expect("Weapon insert text");
+    assert!(insert_text.contains("Weapon"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn completion_with_percent_suggests_unique_name_in_owner_nodes() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gdscript-lsp-percent-completion-{stamp}"));
+    fs::create_dir_all(&root).expect("create workspace root");
+
+    fs::write(
+        root.join("project.godot"),
+        "[application]\nconfig/name=\"gdscript_lsp_test\"\n",
+    )
+    .expect("write project.godot");
+    fs::write(
+        root.join("player.gd"),
+        "extends Node3D\n\nfunc _ready() -> void:\n    %\n",
+    )
+    .expect("write attached script");
+    fs::write(
+        root.join("test_scene.tscn"),
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n\n[node name=\"Root\" type=\"Node3D\"]\nscript = ExtResource(\"1\")\n[node name=\"Hud\" type=\"CanvasLayer\" parent=\".\"]\nunique_name_in_owner = true\n[node name=\"Enemy\" type=\"Node\" parent=\".\"]\n",
+    )
+    .expect("write scene");
+
+    let root_uri = file_uri(&root);
+    let script_uri = file_uri(&root.join("player.gd"));
+    let init = serde_json::to_string(&json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": root_uri
+        }
+    }))
+    .expect("init request");
+
+    let completion = serde_json::to_string(&json!({
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": script_uri.clone() },
+            "position": { "line": 4, "character": 5 },
+        }
+    }))
+    .expect("completion request");
+
+    let mut requests = String::new();
+    requests.push_str(&init);
+    requests.push('\n');
+    requests.push_str(&did_open_message(&script_uri, "extends Node3D\n\nfunc _ready() -> void:\n    %\n"));
+    requests.push('\n');
+    requests.push_str(&completion);
+    requests.push('\n');
+    requests.push_str("{\"method\":\"exit\"}\n");
+
+    let responses = run_lsp_responses(&requests);
+    let completion = response_by_id(&responses, 2).expect("completion response");
+    let items = completion["result"]["items"]
+        .as_array()
+        .expect("completion items");
+    let labels: Vec<String> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str().map(ToString::to_string))
+        .collect();
+    let has_hud = labels.iter().any(|label| label == "Hud");
+    assert!(has_hud);
+
+    let hud = items
+        .iter()
+        .find(|item| item["label"] == "Hud")
+        .expect("Hud completion item");
+    let insert_text = hud["textEdit"]["newText"]
+        .as_str()
+        .or_else(|| hud["insertText"].as_str())
+        .or_else(|| hud["label"].as_str())
+        .expect("Hud insert text");
+    assert!(insert_text.contains("Hud"));
 
     let _ = fs::remove_dir_all(root);
 }

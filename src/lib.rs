@@ -4,6 +4,7 @@ mod docs_meta;
 pub mod engine;
 pub mod formatter;
 pub mod hover;
+mod language;
 pub mod lint;
 pub mod lsp;
 pub mod parity;
@@ -11,6 +12,7 @@ pub mod parser;
 pub mod project_godot;
 pub mod semantic;
 pub mod type_system;
+mod scene_index;
 
 pub use cli::{Cli, Commands, GlobalOptions, LintRuleOverrides};
 pub use code_actions::{
@@ -27,6 +29,7 @@ pub use lint::{
 };
 pub use parity::{build_parity_gap_report, render_parity_gap_report};
 pub use parser::{ParsedScript, ParserError, ScriptDecl, parse_script};
+pub use scene_index::{index_tscn_for_scene, SceneIndex, SceneScriptAttachment};
 pub use project_godot::{
     ProjectGodotConfig, load_project_godot_config, parse_project_godot_config,
 };

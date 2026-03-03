@@ -9,19 +9,23 @@ use std::sync::OnceLock;
 
 use crate::code_actions::{CodeAction, CodeActionKind, code_actions_for_diagnostics_and_mode};
 use crate::engine::{BehaviorMode, EngineConfig};
+use crate::scene_index::SceneIndex;
 use crate::formatter::format_gdscript;
 use crate::hover::{
     HoverWorkspaceDoc, definition_uri_for_known_symbol, definition_uris_for_known_symbol,
     hover_at_with_workspace, known_signatures_for_symbol, method_completions_for_receiver,
-    receiver_type_at_position,
+    implicit_receiver_type_for_position, receiver_type_at_position,
 };
+use crate::language::GDSCRIPT_KEYWORDS;
 use crate::lint::{
     Diagnostic, DiagnosticLevel, LintSettings, check_document_with_settings_and_mode,
 };
 use crate::parser::{ParsedScript, ScriptDeclKind, parse_script};
 use crate::project_godot::load_project_godot_config;
 use crate::semantic::{SemanticDocument, SymbolLocation, SymbolSpan, WorkspaceSemanticIndex};
-use crate::type_system::infer_expression_type as infer_expression_type_ts;
+use crate::type_system::{
+    infer_expression_type as infer_expression_type_ts, property_candidates_for_receiver,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LspRequest {
@@ -33,6 +37,8 @@ struct LspRequest {
 #[derive(Debug, Default)]
 struct LspState {
     workspace_index: WorkspaceSemanticIndex,
+    scene_index: SceneIndex,
+    scene_index_documents: HashMap<String, String>,
     workspace_roots: Vec<PathBuf>,
     project_registry: ProjectRegistry,
     shutdown_received: bool,
@@ -46,7 +52,15 @@ struct ProjectRegistry {
 
 impl LspState {
     fn open_document(&mut self, uri: &str, source: &str) {
-        self.workspace_index.upsert_document(uri, source);
+        if is_gd_uri(uri) {
+            self.workspace_index.upsert_document(uri, source);
+        }
+        scene_index_upsert_document(
+            &mut self.scene_index,
+            &mut self.scene_index_documents,
+            uri,
+            source,
+        );
         self.refresh_project_registry();
     }
 
@@ -57,6 +71,7 @@ impl LspState {
     fn close_document(&mut self, uri: &str) {
         if !self.reindex_document_from_disk(uri) {
             self.workspace_index.remove_document(uri);
+            scene_index_remove_document(&mut self.scene_index, &mut self.scene_index_documents, uri);
         }
         self.refresh_project_registry();
     }
@@ -124,7 +139,7 @@ impl LspState {
     fn index_workspace_files(&mut self) {
         let mut files = Vec::new();
         for root in &self.workspace_roots {
-            collect_gd_files(root, &mut files);
+            collect_workspace_files(root, &mut files);
         }
 
         files.sort();
@@ -133,7 +148,17 @@ impl LspState {
         for path in files {
             if let Ok(source) = fs::read_to_string(&path) {
                 let uri = path_to_file_uri(&path);
-                self.workspace_index.upsert_document(&uri, &source);
+                if is_gd_path(&path) {
+                    self.workspace_index.upsert_document(&uri, &source);
+                }
+                if is_scene_or_script_path(&path) {
+                    scene_index_upsert_document(
+                        &mut self.scene_index,
+                        &mut self.scene_index_documents,
+                        &uri,
+                        &source,
+                    );
+                }
             }
         }
         self.refresh_project_registry();
@@ -151,6 +176,11 @@ impl LspState {
             let change_type = change.get("type").and_then(Value::as_u64).unwrap_or(2);
             if change_type == 3 {
                 self.workspace_index.remove_document(uri);
+                scene_index_remove_document(
+                    &mut self.scene_index,
+                    &mut self.scene_index_documents,
+                    uri,
+                );
                 continue;
             }
             self.reindex_document_from_disk(uri);
@@ -163,18 +193,37 @@ impl LspState {
             return false;
         };
 
-        if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("gd") {
+        if !path.exists() || !is_scene_or_script_uri(uri) {
             return false;
         }
 
         match fs::read_to_string(&path) {
             Ok(source) => {
-                self.workspace_index.upsert_document(uri, &source);
+                if is_gd_uri(uri) {
+                    self.workspace_index.upsert_document(uri, &source);
+                }
+                if is_scene_or_script_uri(uri) {
+                    scene_index_upsert_document(
+                        &mut self.scene_index,
+                        &mut self.scene_index_documents,
+                        uri,
+                        &source,
+                    );
+                }
                 self.refresh_project_registry();
                 true
             }
             Err(_) => false,
         }
+    }
+
+    fn scene_completions(
+        &self,
+        uri: &str,
+        kind: NodePathCompletionKind,
+        query: &str,
+    ) -> Vec<String> {
+        scene_index_query_paths(&self.scene_index, &self.workspace_roots, uri, kind, query)
     }
 
     fn refresh_project_registry(&mut self) {
@@ -231,7 +280,23 @@ fn path_to_file_uri(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
-fn collect_gd_files(root: &Path, out: &mut Vec<PathBuf>) {
+fn is_gd_uri(uri: &str) -> bool {
+    uri.ends_with(".gd")
+}
+
+fn is_scene_or_script_uri(uri: &str) -> bool {
+    is_gd_uri(uri) || uri.ends_with(".tscn")
+}
+
+fn is_gd_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("gd")
+}
+
+fn is_scene_or_script_path(path: &Path) -> bool {
+    matches!(path.extension().and_then(|ext| ext.to_str()), Some("gd" | "tscn"))
+}
+
+fn collect_workspace_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -246,14 +311,40 @@ fn collect_gd_files(root: &Path, out: &mut Vec<PathBuf>) {
             {
                 continue;
             }
-            collect_gd_files(&path, out);
+            collect_workspace_files(&path, out);
             continue;
         }
 
-        if path.extension().and_then(|ext| ext.to_str()) == Some("gd") {
+        if is_scene_or_script_path(&path) {
             out.push(path);
         }
     }
+}
+
+fn completion_context_from_source_and_position(
+    source: &str,
+    line: usize,
+    character: usize,
+) -> Option<NodePathCompletionContext> {
+    let line_idx = line.saturating_sub(1);
+    let line_text = source.lines().nth(line_idx)?;
+    let cursor = line_byte_offset(line_text, character.max(1)).min(line_text.len());
+    let cursors = if cursor < line_text.len() {
+        [cursor, cursor + 1]
+    } else {
+        [cursor, cursor]
+    };
+
+    for candidate_cursor in cursors {
+        if let Some(ctx) = detect_get_node_completion_context(line_text, candidate_cursor) {
+            return Some(ctx);
+        }
+        if let Some(ctx) = detect_shorthand_completion_context(line_text, candidate_cursor) {
+            return Some(ctx);
+        }
+    }
+
+    None
 }
 
 fn read_autoload_names_from_root(root: &PathBuf) -> HashSet<String> {
@@ -458,7 +549,7 @@ fn handle_request(
                             },
                             "completionProvider": {
                                 "resolveProvider": false,
-                                "triggerCharacters": ["."]
+                                "triggerCharacters": [".", "\"", "'", "$", "%"]
                             },
                             "signatureHelpProvider": {
                                 "triggerCharacters": ["(", ","]
@@ -567,15 +658,14 @@ fn handle_request(
                 workspace.as_slice(),
             );
             let result = hover.map_or(Value::Null, |hover| {
-                let has_binding_code_title = hover.body.starts_with("```gdscript\nvar ")
-                    || hover.body.starts_with("```gdscript\nconst ");
+                let has_gdscript_heading_block = hover.body.starts_with("```gdscript\n");
                 let title_markdown =
                     if hover.title.starts_with("class ") && !hover.title.contains('\'') {
                         format!("```gdscript\n{}\n```", hover.title)
                     } else {
                         format!("**{}**", hover.title)
                     };
-                let value = if has_binding_code_title {
+                let value = if has_gdscript_heading_block {
                     hover.body
                 } else {
                     format!("{title_markdown}\n\n{}", hover.body)
@@ -668,6 +758,49 @@ fn handle_request(
             let uri = extract_uri(&params);
             let prefix = completion_prefix_from_params(&params, &source, transport);
             let (line, character) = extract_position(&params, transport);
+            if let Some(node_path_ctx) = completion_context_from_source_and_position(
+                &source,
+                line,
+                character,
+            )
+            .and_then(|ctx| uri.map(|uri| (ctx, uri)))
+            {
+                let line_text = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
+                let query_for_sort = if node_path_ctx.0.query.is_empty() {
+                    prefix.as_deref()
+                } else {
+                    Some(node_path_ctx.0.query.as_str())
+                };
+                let mut items = state
+                    .scene_completions(node_path_ctx.1, node_path_ctx.0.kind, &node_path_ctx.0.query)
+                    .into_iter()
+                    .filter(|candidate| {
+                        if node_path_ctx.0.query.is_empty() {
+                            true
+                        } else {
+                            candidate.starts_with(&node_path_ctx.0.query)
+                        }
+                    })
+                    .map(|candidate| {
+                        completion_item_from_scene_path(
+                            &candidate,
+                            &node_path_ctx.0,
+                            line,
+                            line_text,
+                            transport,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                sort_completion_items(&mut items, query_for_sort);
+
+                return (
+                    id.map(|id| {
+                        json!({"id": id, "result": {"isIncomplete": false, "items": items}})
+                    }),
+                    None,
+                );
+            }
+
             let parsed_for_completion = uri
                 .and_then(|value| state.parsed_for_uri(value))
                 .cloned()
@@ -696,6 +829,30 @@ fn handle_request(
                             })
                         })
                         .collect::<Vec<_>>();
+                items.extend(
+                    property_candidates_for_receiver(&receiver_type, prefix.as_deref(), 200)
+                        .into_iter()
+                        .map(|entry| {
+                            let mut docs = format!(
+                                "```gdscript\nvar {}: {}\n```",
+                                entry.name, entry.property_type
+                            );
+                            if !entry.documentation.trim().is_empty() {
+                                docs.push_str("\n\n");
+                                docs.push_str(entry.documentation.trim());
+                            }
+                            json!({
+                                "label": entry.name,
+                                "kind": 10,
+                                "detail": format!("var {}: {} ({})", entry.name, entry.property_type, entry.class_name),
+                                "documentation": {
+                                    "kind": "markdown",
+                                    "value": docs
+                                },
+                                "insertText": entry.name
+                            })
+                        }),
+                );
                 sort_completion_items(&mut items, prefix.as_deref());
 
                 if !items.is_empty() {
@@ -710,7 +867,7 @@ fn handle_request(
             let mut seen = std::collections::HashSet::new();
             items.extend(completion_entries(
                 "keyword",
-                COMPLETION_KEYWORDS,
+                GDSCRIPT_KEYWORDS,
                 14,
                 prefix.as_deref(),
                 &mut seen,
@@ -898,7 +1055,8 @@ fn handle_request(
                 .and_then(|value| state.parsed_for_uri(value))
                 .cloned()
                 .unwrap_or_else(|| parse_script(&source, uri.unwrap_or("stdin://lsp.gd")));
-            let receiver_type = receiver_type_at_position(line, character, &parsed_for_definition);
+            let explicit_receiver_type =
+                receiver_type_at_position(line, character, &parsed_for_definition);
             let mut locations = symbol
                 .as_deref()
                 .map(|symbol_name| {
@@ -909,7 +1067,8 @@ fn handle_request(
             if locations.is_empty()
                 && let Some(symbol) = symbol.as_deref()
             {
-                let docs = definition_uris_for_known_symbol(symbol, receiver_type.as_deref());
+                let docs =
+                    definition_uris_for_known_symbol(symbol, explicit_receiver_type.as_deref());
                 for doc_uri in docs {
                     locations.push(virtual_location_for_uri(&doc_uri, transport));
                 }
@@ -1480,6 +1639,180 @@ fn completion_prefix_from_params(
     }
 }
 
+#[derive(Clone, Copy)]
+enum NodePathCompletionKind {
+    Dollar,
+    Percent,
+    GetNode,
+}
+
+#[derive(Clone)]
+struct NodePathCompletionContext {
+    kind: NodePathCompletionKind,
+    query: String,
+    range_start: usize,
+    range_end: usize,
+}
+
+fn completion_item_from_scene_path(
+    candidate: &str,
+    context: &NodePathCompletionContext,
+    line: usize,
+    line_text: &str,
+    transport: Transport,
+) -> Value {
+    let replacement = candidate.to_string();
+    let range = lsp_range(
+        line,
+        byte_to_character(line_text, context.range_start),
+        line,
+        byte_to_character(line_text, context.range_end),
+        transport,
+    );
+    json!({
+        "label": candidate,
+        "kind": 7,
+        "detail": replacement,
+        "textEdit": {
+            "range": range,
+            "newText": replacement
+        }
+    })
+}
+
+fn detect_shorthand_completion_context(
+    line_text: &str,
+    cursor: usize,
+) -> Option<NodePathCompletionContext> {
+    let bytes = line_text.as_bytes();
+    if cursor == 0 || cursor > bytes.len() {
+        return None;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let prev = bytes[start - 1];
+        if is_node_path_char(prev) {
+            start = start.saturating_sub(1);
+            continue;
+        }
+
+        if prev == b'$' || prev == b'%' {
+            let kind = if prev == b'$' {
+                NodePathCompletionKind::Dollar
+            } else {
+                NodePathCompletionKind::Percent
+            };
+            return Some(NodePathCompletionContext {
+                kind,
+                query: line_text[start..cursor].to_string(),
+                range_start: start,
+                range_end: cursor,
+            });
+        }
+
+        return None;
+    }
+
+    None
+}
+
+fn detect_get_node_completion_context(
+    line_text: &str,
+    cursor: usize,
+) -> Option<NodePathCompletionContext> {
+    let slice = &line_text[..cursor];
+    let open_paren_idx = find_last_node_call_open_paren(slice)?;
+    let bytes = slice.as_bytes();
+    let mut idx = open_paren_idx + 1;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return Some(NodePathCompletionContext {
+            kind: NodePathCompletionKind::GetNode,
+            query: String::new(),
+            range_start: idx,
+            range_end: idx,
+        });
+    }
+
+    let quote = match bytes[idx] {
+        b'"' | b'\'' => bytes[idx],
+        _ => return None,
+    };
+
+    let query_start = idx + 1;
+    let mut idx = query_start;
+    while idx < bytes.len() {
+        if idx >= cursor {
+            return Some(NodePathCompletionContext {
+                kind: NodePathCompletionKind::GetNode,
+                query: line_text[query_start..cursor].to_string(),
+                range_start: query_start,
+                range_end: cursor,
+            });
+        }
+
+        let byte = bytes[idx];
+        if byte == quote {
+            return None;
+        }
+        if byte == b'\\' && idx + 1 < bytes.len() {
+            idx += 1;
+        }
+        idx += 1;
+    }
+
+    Some(NodePathCompletionContext {
+        kind: NodePathCompletionKind::GetNode,
+        query: line_text[query_start..cursor].to_string(),
+        range_start: query_start,
+        range_end: cursor,
+    })
+}
+
+fn find_last_node_call_open_paren(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let names = ["get_node_or_null", "get_node"];
+
+    let mut best = None;
+    for name in names {
+        let name_bytes = name.as_bytes();
+        let mut pos = 0usize;
+        while pos + name_bytes.len() <= bytes.len() {
+            if &bytes[pos..pos + name_bytes.len()] == name_bytes
+                && is_boundary_byte(bytes, pos, name_bytes.len())
+            {
+                let mut i = pos + name_bytes.len();
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'(' {
+                    best = Some(i);
+                }
+            }
+            pos += 1;
+        }
+    }
+    best
+}
+
+fn is_boundary_byte(bytes: &[u8], pos: usize, len: usize) -> bool {
+    let before_ok = pos == 0 || !is_identifier_char(bytes[pos - 1]);
+    let after_ok = pos + len >= bytes.len() || !is_identifier_char(bytes[pos + len]);
+    before_ok && after_ok
+}
+
+fn is_node_path_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, b'_' | b'/' | b'.' | b'-' | b'@' | b':')
+}
+
+fn byte_to_character(line_text: &str, byte_idx: usize) -> usize {
+    line_text[..byte_idx.min(line_text.len())].chars().count() + 1
+}
+
 fn line_byte_offset(line: &str, character: usize) -> usize {
     line.char_indices()
         .map(|(idx, _)| idx)
@@ -1489,6 +1822,129 @@ fn line_byte_offset(line: &str, character: usize) -> usize {
 
 fn is_identifier_char(byte: u8) -> bool {
     (byte as char).is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn scene_index_upsert_document(
+    index: &mut SceneIndex,
+    scene_documents: &mut HashMap<String, String>,
+    uri: &str,
+    source: &str,
+) {
+    if !is_scene_uri(uri) {
+        return;
+    }
+
+    scene_documents.insert(uri.to_string(), source.to_string());
+    scene_index_rebuild(index, scene_documents);
+}
+
+fn scene_index_remove_document(
+    index: &mut SceneIndex,
+    scene_documents: &mut HashMap<String, String>,
+    uri: &str,
+) {
+    if !is_scene_uri(uri) {
+        return;
+    }
+
+    scene_documents.remove(uri);
+    scene_index_rebuild(index, scene_documents);
+}
+
+fn scene_index_query_paths(
+    index: &SceneIndex,
+    workspace_roots: &[PathBuf],
+    uri: &str,
+    kind: NodePathCompletionKind,
+    query: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for script_path in index.scripts() {
+        if !script_resource_matches_uri(&script_path, uri, workspace_roots) {
+            continue;
+        }
+
+        for attachment in index.attachments_for_script(&script_path) {
+            match kind {
+                NodePathCompletionKind::Dollar | NodePathCompletionKind::GetNode => {
+                    out.extend(
+                        attachment
+                            .child_node_paths
+                            .iter()
+                            .filter_map(|path| relative_node_path(&attachment.attached_node_path, path)),
+                    );
+                }
+                NodePathCompletionKind::Percent => {
+                    if let Some(unique_name) = &attachment.attached_node_unique_name {
+                        out.push(unique_name.trim_start_matches('%').to_string());
+                    }
+                    out.extend(
+                        attachment
+                            .child_unique_names
+                            .iter()
+                            .map(|value| value.trim_start_matches('%').to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out.into_iter()
+        .filter(|candidate| candidate.starts_with(query))
+        .collect()
+}
+
+fn relative_node_path(base: &str, candidate: &str) -> Option<String> {
+    if candidate == base {
+        return None;
+    }
+
+    let prefix = format!("{base}/");
+    candidate.strip_prefix(&prefix).map(ToString::to_string)
+}
+
+fn scene_index_rebuild(index: &mut SceneIndex, scene_documents: &HashMap<String, String>) {
+    let mut next = SceneIndex::new();
+    for (scene_path, source) in scene_documents {
+        next.add_scene(scene_path, source);
+    }
+    *index = next;
+}
+
+fn is_scene_uri(uri: &str) -> bool {
+    uri.ends_with(".tscn")
+}
+
+fn script_resource_matches_uri(script_resource: &str, uri: &str, workspace_roots: &[PathBuf]) -> bool {
+    if script_resource == uri {
+        return true;
+    }
+
+    if !uri.starts_with("file://") {
+        return false;
+    }
+
+    let Some(path) = file_uri_to_path(uri) else {
+        return false;
+    };
+
+    let path_text = path.to_string_lossy();
+    if script_resource == path_text {
+        return true;
+    }
+    if script_resource.starts_with("res://") {
+        let res_path = script_resource.trim_start_matches("res://");
+        for root in workspace_roots {
+            let candidate = root.join(res_path);
+            if candidate == path {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn completion_entries(
@@ -1856,10 +2312,19 @@ fn call_context_at_position(
         .find(|frame| frame.callee_expr.is_some())?;
     let callee_expr = frame.callee_expr.as_deref()?.trim();
     let (callee, receiver_expr) = split_callee_expression(callee_expr)?;
-    let receiver_type = receiver_expr.and_then(|expr| {
+    let local_method_override =
+        script
+            .declarations
+            .iter()
+            .any(|decl| matches!(decl.kind, ScriptDeclKind::Function) && decl.name == callee && decl.line <= line);
+    let mut receiver_type = receiver_expr.and_then(|expr| {
         infer_expression_type_ts(script, expr, line)
             .or_else(|| infer_expression_type(expr, state, uri, source, line))
     });
+
+    if receiver_type.is_none() && receiver_expr.is_none() && !local_method_override {
+        receiver_type = implicit_receiver_type_for_position(script, line);
+    }
 
     Some(CallContext {
         callee,
@@ -2051,17 +2516,15 @@ fn infer_expression_type(
     if let Some((base_expr, member)) = expr.rsplit_once('.') {
         let base_type = infer_expression_type(base_expr, state, uri, source, line)?;
         let member = member.trim();
-        if let Some(method_name) = member.strip_suffix("()") {
+        if let Some(method_name) = call_name_from_expression(member) {
             return known_signatures_for_symbol(method_name, Some(&base_type), 1)
                 .into_iter()
                 .find_map(|signature| return_type_from_signature_label(&signature.label));
         }
     }
 
-    if let Some(function_name) = expr.strip_suffix("()")
-        && is_valid_identifier_name(function_name.trim())
-    {
-        return function_return_type_for_name(state, uri, source, function_name.trim());
+    if let Some(function_name) = call_name_from_expression(expr) {
+        return function_return_type_for_name(state, uri, source, function_name);
     }
 
     if is_valid_identifier_name(expr) {
@@ -2099,12 +2562,17 @@ fn function_return_type_for_name(
         parse_script(source, "stdin://lsp.gd")
     };
 
-    parsed
+    let local = parsed
         .declarations
         .iter()
         .find(|decl| matches!(decl.kind, ScriptDeclKind::Function) && decl.name == function_name)
         .and_then(|decl| function_signature_from_script(&parsed, decl.line))
-        .and_then(|signature| return_type_from_signature_label(&signature))
+        .and_then(|signature| return_type_from_signature_label(&signature));
+
+    local.or_else(|| {
+        crate::type_system::builtin_signature(function_name)
+            .and_then(|(signature, _)| return_type_from_signature_label(&signature))
+    })
 }
 
 fn function_signature_from_script(script: &ParsedScript, line: usize) -> Option<String> {
@@ -2168,6 +2636,25 @@ fn return_type_from_signature_label(label: &str) -> Option<String> {
     }
 }
 
+fn call_name_from_expression(expr: &str) -> Option<&str> {
+    let trimmed = expr.trim();
+    let open_idx = trimmed.find('(')?;
+    let close_idx = trimmed.rfind(')')?;
+    if close_idx < open_idx {
+        return None;
+    }
+    if !trimmed[close_idx + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let name = trimmed[..open_idx].trim();
+    if is_valid_identifier_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 fn is_type_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -2189,7 +2676,7 @@ fn rename_conflict_reason(
         return None;
     }
 
-    if COMPLETION_KEYWORDS.contains(&new_name) {
+    if GDSCRIPT_KEYWORDS.contains(&new_name) {
         return Some("reserved keyword".to_string());
     }
 
@@ -2767,42 +3254,6 @@ fn full_document_range(source: &str, transport: Transport) -> Value {
     lsp_range(1, 1, end_line, end_character, transport)
 }
 
-const COMPLETION_KEYWORDS: &[&str] = &[
-    "and",
-    "as",
-    "assert",
-    "await",
-    "break",
-    "breakpoint",
-    "class",
-    "class_name",
-    "const",
-    "continue",
-    "elif",
-    "else",
-    "enum",
-    "extends",
-    "for",
-    "func",
-    "if",
-    "in",
-    "is",
-    "match",
-    "not",
-    "or",
-    "pass",
-    "preload",
-    "return",
-    "self",
-    "signal",
-    "static",
-    "super",
-    "var",
-    "void",
-    "when",
-    "while",
-];
-
 const COMPLETION_BUILTINS: &[&str] = &[
     "abs",
     "Array",
@@ -2911,7 +3362,14 @@ pub fn run_with_paths_and_command(path: &Path, source: &str) -> Result<Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::run_stdio_with;
+    use std::path::PathBuf;
+
+    use crate::scene_index::SceneIndex;
+
+    use super::{
+        NodePathCompletionKind, completion_context_from_source_and_position, run_stdio_with,
+        scene_index_query_paths,
+    };
 
     #[test]
     fn handles_unknown_method() {
@@ -2924,5 +3382,41 @@ mod tests {
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("unknown method"));
+    }
+
+    #[test]
+    fn get_node_context_detects_in_string_query() {
+        let source = "extends Node3D\n\nfunc _ready() -> void:\n    var node = get_node(\"We\")\n";
+        let context =
+            completion_context_from_source_and_position(source, 4, 27).expect("get_node context");
+        assert!(matches!(context.kind, NodePathCompletionKind::GetNode));
+        assert_eq!(context.query, "W");
+    }
+
+    #[test]
+    fn get_node_scene_query_uses_script_attachment_and_prefix() {
+        let mut index = SceneIndex::new();
+        index.add_scene(
+            "res://test_scene.tscn",
+            r#"[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://player.gd" id="1"]
+
+[node name="Root" type="Node3D"]
+script = ExtResource("1")
+[node name="Weapon" type="Node3D" parent="."]
+[node name="Scope" type="Node3D" parent="."]
+[node name="WeaponFlash" type="Node3D" parent="Weapon"]
+"#,
+        );
+        let workspace_roots = vec![PathBuf::from("/tmp/ws")];
+        let out = scene_index_query_paths(
+            &index,
+            &workspace_roots,
+            "file:///tmp/ws/player.gd",
+            NodePathCompletionKind::GetNode,
+            "W",
+        );
+        assert!(out.iter().any(|value| value == "Weapon"));
     }
 }
